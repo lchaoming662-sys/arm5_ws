@@ -13,6 +13,8 @@
 用法：
     /usr/bin/python3 ~/arm5_ws/tools/estimate_object_pose.py
     加 --model target_cube 会顺便读 Gazebo 内部真值做对照。
+    加 --json 则只输出一行机器可读结果（供抓取流水线消费），人类可读
+    的过程输出全部丢弃。
 
 分割思路：
   视野里绝大多数点是地面，所以先取 z 的直方图峰值当地面高度，把地面附近
@@ -24,6 +26,8 @@
   两边参考系必须一致，否则误差里混进的是坐标系差异而不是算法误差。
 """
 import argparse
+import io
+import json
 import os
 import subprocess
 import sys
@@ -198,7 +202,24 @@ def main():
                          '依据是这条臂只能抓地面上的物体；设 -1 关闭')
     ap.add_argument('--model', default=None,
                     help='顺便读该 Gazebo 模型的真值做对照，如 target_cube')
+    ap.add_argument('--json', action='store_true',
+                    help='只输出一行 JSON（给抓取流水线消费），'
+                         '人类可读的过程输出全部丢弃')
     args = ap.parse_args()
+
+    # --json 模式下把过程 print 全部导进黑洞，只留最后那一行结果。
+    # 用 stdout 重定向而不是逐个改 print，是为了不动那 20 多行诊断输出 ——
+    # 那些内容在调试时很有用，不该为了机器可读而牺牲掉。
+    real_stdout = sys.stdout
+    if args.json:
+        sys.stdout = io.StringIO()
+
+    def finish(code, payload=None):
+        """收尾：恢复 stdout，并按需吐出那一行 JSON。"""
+        sys.stdout = real_stdout
+        if payload is not None:
+            print(json.dumps(payload, ensure_ascii=False))
+        return code
 
     rclpy.init()
     node = Node('estimate_object_pose',
@@ -223,13 +244,13 @@ def main():
               file=sys.stderr)
         node.destroy_node()
         rclpy.shutdown()
-        return 2
+        return finish(2)
     if 'msg' not in joints:
         print('超时：没收到 /joint_states，无法按 URDF 剔除自身遮挡。',
               file=sys.stderr)
         node.destroy_node()
         rclpy.shutdown()
-        return 2
+        return finish(2)
     sub.destroy()
     sub_j.destroy()
 
@@ -255,7 +276,7 @@ def main():
               file=sys.stderr)
         node.destroy_node()
         rclpy.shutdown()
-        return 3
+        return finish(3)
     t = tr.transform.translation
     q = tr.transform.rotation
     R = quat_to_matrix(q.x, q.y, q.z, q.w)
@@ -293,7 +314,7 @@ def main():
         print('没找到候选物体。可能目标不在视野、或点数太少。', file=sys.stderr)
         node.destroy_node()
         rclpy.shutdown()
-        return 4
+        return finish(4)
     print(f'  聚成 {len(clusters)} 簇，取最大的一簇')
 
     obj = clusters[0]
@@ -312,10 +333,30 @@ def main():
     # 根本测不到。只能靠「物体贴地」这个前提反推：平顶物体贴地放置时，
     # 顶面离地高度就等于它的高度。这条臂本来也够不着台面上的东西
     # （见 docs/使用说明书.md 第七节），所以这个前提在本工程里始终成立。
+    center_z = None
     if args.frame == 'base_link' and z_ground is not None:
-        z_top = float(hi[2])
-        print(f'  顶面高度 {z_top:+.4f}   离地高度 {(z_top - z_ground)*1000:.1f} mm')
-        print(f'  贴地反推的中心 z = {(z_ground + z_top) / 2:+.4f}'
+        # 顶面高度怎么取，决定了中心 z 的精度，这里有讲究。
+        #
+        # 直接取 max 会**系统性偏高**：相机光轴偏竖直 12.3 度（不是正下方），
+        # 于是同一个水平顶面在点云里是斜的 —— 远边的 z 比近边高。取 max 等于
+        # 专门去用「远边那条棱」，而那条棱到相机的距离最长、深度噪声最大。
+        # 实测 25 mm 的方块，max 给出离地 27.7 mm，偏高 2.7 mm。
+        #
+        # 这 2.7 mm 会一路传下去：中心 z 偏高 → 抓取点相对物体压低 → 手指
+        # 多压 2.7 mm。而 docs/踩坑记录.md 第 27 条记着实测多压 1.7 mm 就能
+        # 把方块挤走 11 mm，所以这不是小数点后面的事。
+        #
+        # 改用 90 分位：它落在顶面那片区域里，又避开了最外圈那条棱和长尾噪声。
+        # 为什么不是更低：分位取得太低会切进顶面内部，反而低估。
+        # 之所以敢用分位数，是因为这一簇是**平面分割 + 连通域**的结果，
+        # 主体就是顶面本身，不是侧面或杂散点。
+        z_top_max = float(hi[2])
+        z_top_p90 = float(np.percentile(obj[:, 2], 90.0))
+        z_top = z_top_p90
+        center_z = (z_ground + z_top) / 2
+        print(f'  顶面高度 max {z_top_max:+.4f} / 90分位 {z_top_p90:+.4f}'
+              f'   离地高度 {(z_top - z_ground)*1000:.1f} mm（取 90 分位）')
+        print(f'  贴地反推的中心 z = {center_z:+.4f}'
               '（相机几乎垂直向下，测不到中心高度）')
 
     if args.model:
@@ -327,12 +368,44 @@ def main():
             print(f'  真值中心  x {truth[0]:+.4f}   y {truth[1]:+.4f}   '
                   f'z {truth[2]:+.4f}')
             print(f'  误差      dx {center[0]-truth[0]:+.4f}   '
-                  f'dy {center[1]-truth[1]:+.4f}   '
-                  f'dz {center[2]-truth[2]:+.4f}')
+                  f'dy {center[1]-truth[1]:+.4f}')
+            # z 要跟 center_z 比，不能跟 center[2] 比 ——
+            # center[2] 是点云包围盒的中心，而这一簇基本就是**顶面**，
+            # 所以 center[2] ≈ 顶面高度（≈0.026），拿它跟物体中心真值（0.0125）
+            # 比会凭空报出 +12 mm 的误差，看着像算法坏了，其实比错了对象。
+            # 能比的是贴地反推出来的 center_z。
+            if center_z is None:
+                print('  误差      dz （没算 center_z，跳过）')
+            else:
+                print(f'  误差      dz {center_z - truth[2]:+.4f}'
+                      '   ← 与贴地反推的 center_z 比')
+
+    # 机器可读输出。字段说明（下游 grab_pipeline 会照这些语义用）：
+    #   center_xy   实测，可直接用（实测误差 2.0 / 0.0 mm）
+    #   center_z    **反推值**，不是量出来的；相机近乎垂直向下，只拍到顶面。
+    #               误差实测 +1.2 mm，别当精确值用。
+    #   size_xy     **高估值**。点是物体顶面的投影再叠上边缘与深度噪声，
+    #               25 mm 的方块量出 28~29 mm（约 +15%）。要拿它当碰撞盒
+    #               尺寸用的话得先减掉这个膨胀，否则 planning 里的方块
+    #               比实物大 3~4 mm。
+    #   size_z      只反映可见的那层顶面（实测 5.6 mm），不是物体高度。
+    payload = {
+        'center_xy': [round(float(center[0]), 5), round(float(center[1]), 5)],
+        'center_z': None if center_z is None else round(float(center_z), 5),
+        'z_top': None if center_z is None else round(float(z_top), 5),
+        'size_xy': [round(float(size[0]), 5), round(float(size[1]), 5)],
+        'size_z': round(float(size[2]), 5),
+        'z_ground': None if z_ground is None else round(float(z_ground), 5),
+        'n_points': int(len(obj)),
+        'n_clusters': int(len(clusters)),
+        'frame': args.frame,
+    }
+    if args.model:
+        payload['gazebo_truth'] = gazebo_truth(args.model)
 
     node.destroy_node()
     rclpy.shutdown()
-    return 0
+    return finish(0, payload)
 
 
 if __name__ == '__main__':

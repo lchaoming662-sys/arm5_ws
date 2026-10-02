@@ -41,6 +41,7 @@ def generate_launch_description():
     execute = LaunchConfiguration("execute")
     probe = LaunchConfiguration("probe")
     place = LaunchConfiguration("place")
+    perceive = LaunchConfiguration("perceive")
     use_sim_time = LaunchConfiguration("use_sim_time")
 
     return LaunchDescription([
@@ -58,6 +59,10 @@ def generate_launch_description():
             description="是否接放回（Place）阶段。false = 只抓不起，"
                         "退回 4ff2c23 之前的老行为"),
         DeclareLaunchArgument(
+            "perceive", default_value="true",
+            description="是否先用腕部相机感知目标位姿。false = 直接用脚本里的"
+                        "先验位姿 OBJECT_XYZ（仅调试/对照用）"),
+        DeclareLaunchArgument(
             "use_sim_time", default_value="true",
             description="跟着 Gazebo 的 /clock 走时间（仿真时必须 true）"),
 
@@ -66,6 +71,7 @@ def generate_launch_description():
         SetEnvironmentVariable(name="MTC_EXECUTE", value=execute),
         SetEnvironmentVariable(name="MTC_PROBE", value=probe),
         SetEnvironmentVariable(name="MTC_PLACE", value=place),
+        SetEnvironmentVariable(name="MTC_PERCEIVE", value=perceive),
 
         Node(
             package="arm_bringup",

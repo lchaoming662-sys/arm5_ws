@@ -34,6 +34,7 @@ ROS 1 版本（仓库无 ros2 分支，apt 三个发行版都没有），MTC 才
       · 缺 ompl_planning.yaml -> 悄悄退化成 CHOMP 规划器，不报错，
                                但规划的已经不是我们配的那套
 """
+import json
 import math
 import os
 import subprocess
@@ -47,6 +48,7 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from moveit.task_constructor import core, stages
 from rclpy.action import ActionClient
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 _WS = os.path.expanduser('~/arm5_ws')
 
@@ -64,16 +66,40 @@ GRIPPER_JOINT = 'right_claw_joint'
 ARM_ACTION = '/arm_controller/follow_joint_trajectory'
 GRIPPER_ACTION = '/gripper_controller/follow_joint_trajectory'
 GRIPPER_GROUP = 'gripper'      # SRDF 里的夹爪组，MoveTo 开合都用它
+
+# 扫描位形：SRDF 里 grasp_ready 的关节值。感知前要先摆到这里 ——
+# 腕部相机装在爪上，零位时光轴近乎水平（实测与竖直夹角 85.2°），
+# 地面上的东西根本不在视野里；这个位形实测光轴偏竖直 12.3°、距目标 106 mm。
+# 放在这里而不是让感知脚本自己动，是为了让「感知前把臂摆好」这件事
+# 在流水线里看得见 —— 脚本只负责看，不负责动。
+SCAN_POSE = (0.0, -0.0385, -0.1531, -1.45, 0.0)
+SCAN_POSE_SEC = 6.0
+
+# 工件尺寸：25 mm 立方体。**不取感知值** ——
+# 感知量的是点云在水平面上的投影范围，叠上边缘与深度噪声后系统性偏大
+# （实测 25 mm 的方块量出 26.5~28.2 × 29.2~29.5 mm，约 +15%）。而工件
+# 尺寸本来就不是「现场才知道」的东西，它来自图纸/BOM，属于配置项。
+# 真要用感知尺寸，得先把那份系统膨胀标定掉。
+OBJECT_SIZE = (0.025, 0.025, 0.025)
+
+# 物体的先验位姿，只在 perceive:=false 时用（调试与对照用）。
+# 正常路径由 tools/estimate_object_pose.py 给出，见 perceive_object_pose()。
 OBJECT_XYZ = (0.0267, 0.0245, 0.0125)   # 世界文件里的真值（贴地 25 mm 立方体）
 
-# 放回目标：**方块中心**在 base_link 下的目标 XY。
-# 默认与 OBJECT_XYZ 相同，也就是「原位放回」。这不是偷懒 —— 旧演示
-# tools/pick_demo_moveit.py 第 8 步也是原位放回（沿 Z 压回台面），保持一致
-# 才能拿两边的抬起量/落点直接对比。
-# 高度不在这里给：方块中心的高度恒为「贴台面」= OBJECT_XYZ[2]，
-# 由 GRASP_TCP_Z 换算成 tcp 高度（见放回那一段）。
-PLACE_XYZ = OBJECT_XYZ
+# 流水线实际使用的物体中心（base_link 系）。启动时先用先验值；感知成功后
+# 会被 perceive_object_pose() 的结果覆盖。
+#
+# 刻意做成「可变 + 用到时现算派生量」而不是一堆互相引用的常量：
+# 位姿一改，GRASP_TCP_Z_OFFSET 与放置点都得跟着变，把它们做成模块常量就
+# 必然出现「改了位姿忘了重算派生量」——而那种错误的症状是抓取点整体偏移
+# 几毫米，伺服报容差失败，看不出根因（见 docs/踩坑记录.md 第 34 条）。
+OBJ_POSE = list(OBJECT_XYZ)
 
+# 放回策略：**原位放回**，即放回抓起来时的那个 XY。
+# 这不是偷懒 —— 旧演示 tools/pick_demo_moveit.py 第 8 步也是原位放回
+# （沿 Z 压回台面），保持一致才能拿两边的抬起量/落点直接对比。
+# 要放到别处，把放回段那两行 place_tcp.pose.position.x/y 换成别的目标即可。
+#
 # 抬起与下压共用一个距离。绑成一对：下压要正好把方块送回台面，
 # 压过头会撞台面（伺服顶住不动，JTC 报 GOAL_TOLERANCE_VIOLATED）。
 LIFT_DISTANCE = 0.050
@@ -90,17 +116,27 @@ CART_VEL_SCALE = 0.25
 CART_ACC_SCALE = 0.25
 CART_MAX_STEP = 0.004      # 笛卡尔路径步长 4 mm
 
-# 抓取/放置位姿下的 tcp 高度（相对台面），以及它相对【物体中心】的偏移。
+# 抓取/放置位姿下的 tcp 高度（相对台面）。
 # 物理含义是「在保证指尖不碰台面的前提下把抓手放到最低」，让指盒尽量多地
 # 覆盖方块：
 #     tcp 高度 = 台面 + 指尖间隙 + 指盒半长 = 0.0046 + 0.0185 = 0.0231 m
-# 抓取时 GenerateGraspPose 生成的位姿原点在**物体中心**，而 tcp 是两指夹持面
-# 中点，所以要补一个偏移；偏移取大了指尖会戳进台面 5.4 mm，实测报的是容差而
-# 不是碰撞（见 docs/踩坑记录.md 第 34 条）。
+# 这是**机器人**的常量，与目标无关。抓取时 GenerateGraspPose 生成的位姿原点
+# 在**物体中心**，而 tcp 是两指夹持面中点，所以要减掉物体中心高度得到偏移；
+# 偏移取大了指尖会戳进台面 5.4 mm，实测报的是容差而不是碰撞
+# （见 docs/踩坑记录.md 第 34 条）。
 FINGER_HALF_LEN = 0.0185
 FINGER_TIP_CLEARANCE = 0.0046
 GRASP_TCP_Z = FINGER_TIP_CLEARANCE + FINGER_HALF_LEN
-GRASP_TCP_Z_OFFSET = GRASP_TCP_Z - OBJECT_XYZ[2]
+
+
+def grasp_tcp_z_offset():
+    """抓取时 tcp 相对物体中心的抬高量。
+
+    现算而不是存成常量：OBJ_POSE 会被感知结果改写，而这个偏移对物体中心
+    高度是敏感的 —— 感知给的中心 z 有 +1.5 mm 系统偏差（相机近乎垂直向下，
+    只能看到顶面，中心靠「贴地反推」），直接算进去会让指尖多压 1.5 mm。
+    """
+    return GRASP_TCP_Z - OBJ_POSE[2]
 
 # 规划失败时要汇报的阶段名，顺序与流水线一致（含 SimpleGrasp 容器内部的）。
 # SimpleGrasp 是个 SerialContainer，MTC 的 Python 绑定没暴露 children()，
@@ -250,17 +286,85 @@ def report_failures(task, names, limit=3):
             print(f'      ... 另有 {len(fails) - limit} 条', file=sys.stderr)
 
 
-def add_object_to_scene():
+def send_joint_target(action, names, targets, duration, timeout=120.0):
+    """把一个关节空间目标直接发到控制器，不经过规划。
+
+    感知阶段要用：相机装在腕上，不先摆到看得见目标的位形就拍不到地面。
+    这里刻意**不用** MoveIt 规划 —— 扫描位形是 SRDF 里给定的常量位形，
+    直接插值过去即可；而且此刻规划场景里的物体还没加进去（物体位姿正是
+    感知要给的），让 MoveIt 在那个残缺场景里规划纯属添乱。
+
+    timeout 按墙上时间给：仿真 RTF 只有 ~0.48。
+    """
+    rclpy.init()
+    node = rclpy.create_node('grasp_pipeline_mover')
+    try:
+        cli = ActionClient(node, FollowJointTrajectory, action)
+        if not cli.wait_for_server(timeout_sec=10.0):
+            print(f'  {action} 不可用', file=sys.stderr)
+            return False
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = JointTrajectory()
+        goal.trajectory.joint_names = list(names)
+        pt = JointTrajectoryPoint()
+        pt.positions = list(targets)
+        pt.time_from_start.sec = int(duration)
+        goal.trajectory.points = [pt]
+        return _run_goal(node, cli, goal, timeout)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def perceive_object_pose():
+    """调 tools/estimate_object_pose.py 拿目标位姿。返回 dict 或 None。
+
+    为什么走子进程而不是 import 进来：
+    那个脚本要 rclpy，而本进程的主节点是 rclcpp 的。虽然实测两者可以共存
+    （execute_solution 里就这么干的），但感知发生在**规划之前**，那时
+    rclcpp 节点已建好、MoveIt 参数已注入，混进来徒增不确定性。子进程还
+    顺带隔离了它 import 时那次约 1 秒的 xacro 展开。
+
+    那个脚本是整段 CLI，所以按约定解析 --json 输出的最后一行。
+    """
+    cmd = ('set +u; source /opt/ros/humble/setup.bash; '
+           f'source {_WS}/install/setup.bash; export PATH=/usr/bin:$PATH; '
+           f'/usr/bin/python3 {_WS}/tools/estimate_object_pose.py --json')
+    r = subprocess.run(['bash', '-c', cmd], capture_output=True, text=True,
+                       timeout=150)
+    if r.returncode != 0:
+        print(f'  感知脚本退出码 {r.returncode}', file=sys.stderr)
+        print((r.stderr or '').strip()[-600:], file=sys.stderr)
+        return None
+    for line in reversed((r.stdout or '').strip().splitlines()):
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            return json.loads(line)
+        except ValueError as exc:
+            print(f'  感知结果不是合法 JSON：{exc}', file=sys.stderr)
+            return None
+    print('  感知脚本没有输出 JSON', file=sys.stderr)
+    return None
+
+
+def add_object_to_scene(xyz, size):
     """把目标加进 move_group 的规划场景。
 
+    xyz 是**感知得到**的物体中心，size 是配置的工件尺寸（不取感知值，
+    理由见调用处）。
+
     必须在规划之前、任务之外做：GenerateGraspPose 是从 scene() 查物体的，
-    而 scene() 给的是**初始场景**，任务内部的 ModifyPlanningScene 只改向下传播
-    的状态、到不了那里。实测报错就是 "object 'target_cube' not in scene"。
+    而 scene() 给的是**初始场景**，任务内部的 ModifyPlanningScene 只改向下
+    传播的状态、到不了那里。实测报错就是 "object 'target_cube' not in scene"。
     官方 demo 用 moveit_commander 在外面加物体，也是同一个道理。
     """
     cmd = ('set +u; source /opt/ros/humble/setup.bash; '
            f'source {_WS}/install/setup.bash; '
-           f'/usr/bin/python3 {_WS}/tools/scene_object.py --add')
+           f'/usr/bin/python3 {_WS}/tools/scene_object.py --add '
+           f'--xyz {xyz[0]:.5f} {xyz[1]:.5f} {xyz[2]:.5f} '
+           f'--size {size[0]:.5f} {size[1]:.5f} {size[2]:.5f}')
     r = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True)
     print((r.stdout or r.stderr).strip())
     return r.returncode == 0
@@ -299,7 +403,49 @@ def main():
     opts.automatically_declare_parameters_from_overrides = True
     node = rclcpp.Node('grasp_pipeline_mtc', opts)
 
-    if not add_object_to_scene():
+    # ---------------------------------------------------------------------
+    # 感知：先摆到扫描位形，再看一眼目标在哪，然后才把物体放进规划场景。
+    #
+    # 顺序不能换：相机装在腕上，零位时看不到地面；而物体位姿正是要靠感知
+    # 给的，所以「摆位形」必须发生在「加物体」之前。
+    # ---------------------------------------------------------------------
+    do_perceive = os.environ.get('MTC_PERCEIVE', '').lower() in ('1', 'true')
+    if do_perceive:
+        print('把臂摆到扫描位形（SRDF grasp_ready）...')
+        if not send_joint_target(ARM_ACTION, ARM_JOINTS, SCAN_POSE, SCAN_POSE_SEC):
+            print('摆到扫描位形失败，感知无从做起。', file=sys.stderr)
+            return 6
+        # 相机 10 Hz，等它出两帧新的。位形是静止的，不需要额外稳定时间。
+        time.sleep(2.0)
+
+        print('感知目标位姿 ...')
+        payload = perceive_object_pose()
+        if payload is None:
+            print('感知失败。确认：相机没被关掉、目标在视野内、'
+                  'TF 在发。也可以用 perceive:=false 退回用先验位姿（仅调试）。',
+                  file=sys.stderr)
+            return 7
+        cx, cy = payload['center_xy']
+        cz = payload.get('center_z')
+        if cz is None:
+            print('感知没给出中心 z（--z-max 把点全滤掉了？），无法定抓取高度。',
+                  file=sys.stderr)
+            return 7
+        print(f'  感知中心 xy ({cx:+.4f}, {cy:+.4f})  中心 z {cz:+.4f}（贴地反推）'
+              f'  点数 {payload.get("n_points")}')
+        print(f'  观测尺寸 xy {payload.get("size_xy")}（工件尺寸用配置的 '
+              f'{OBJECT_SIZE[0]:.3f}，感知值系统性偏大约 15%）')
+        if 'gazebo_truth' in payload:
+            t = payload['gazebo_truth']
+            print(f'  [调试] Gazebo 真值 ({t[0]:+.4f}, {t[1]:+.4f}, {t[2]:+.4f})'
+                  f'  误差 dx {cx - t[0]:+.4f} dy {cy - t[1]:+.4f}')
+        OBJ_POSE[0], OBJ_POSE[1], OBJ_POSE[2] = cx, cy, cz
+        print(f'  抓取点抬高量随之变成 {grasp_tcp_z_offset():.4f} m'
+              f'（= GRASP_TCP_Z {GRASP_TCP_Z:.4f} - 中心 z {cz:.4f}）')
+    else:
+        print(f'感知已关闭，用先验位姿 {tuple(OBJ_POSE)}（仅调试用）')
+
+    if not add_object_to_scene(OBJ_POSE, OBJECT_SIZE):
         print('往场景里加物体失败，规划不可能成功。', file=sys.stderr)
         return 3
 
@@ -308,7 +454,7 @@ def main():
     # 「从上面抓」。这条臂 5 自由度、只能俯抓，如果是侧向候选，
     # 后面 IK 全灭就有了确定解释。用 launch 的 probe:=true 打开。
     if os.environ.get('MTC_PROBE', '').lower() in ('1', 'true'):
-        ox, oy, oz = OBJECT_XYZ
+        ox, oy, oz = OBJ_POSE
         probe = core.Task()
         probe.name = 'probe grasp poses'
         probe.loadRobotModel(node)
@@ -352,9 +498,9 @@ def main():
         time.sleep(0.5)
         return 0
 
-    # launch 用环境变量把这个开关传进来（值形如 "true" / "false"）。
-    # 关掉它就退回「只抓不起」的老行为 —— 放回这一段是新加的，
-    # 出问题时能单独验证前半段，不用整体回退。
+    # launch 用环境变量把这两个开关传进来（值形如 "true" / "false"）。
+    # place 关掉就退回「只抓不起」的老行为 —— 放回段是新加的，出问题时能
+    # 单独验证前半段，不用整体回退。perceive 关掉则退回先验位姿。
     do_place = os.environ.get('MTC_PLACE', '').lower() in ('1', 'true')
 
     task = core.Task()
@@ -439,7 +585,7 @@ def main():
     #     抓取位 TCP 高度 = 台面 + 指尖间隙 + 指盒半长 = 0.0046 + 0.0185 = 0.0231 m
     # 物理含义是「在保证指尖不碰台面的前提下把抓手放到最低」，让指盒尽量多地
     # 覆盖方块。也就是比方块中心高 0.0231 - 0.0125 = 0.0106 m。
-    ik.pose.position.z = GRASP_TCP_Z_OFFSET
+    ik.pose.position.z = grasp_tcp_z_offset()
 
     grasp = stages.SimpleGrasp(gen, 'grasp')
     grasp.setIKFrame(ik)
@@ -533,10 +679,11 @@ def main():
     if do_place:
         place_tcp = PoseStamped()
         place_tcp.header.frame_id = 'base_link'
-        place_tcp.pose.position.x = PLACE_XYZ[0]
-        place_tcp.pose.position.y = PLACE_XYZ[1]
+        # 原位放回：目标 XY 就是感知给出的物体中心 XY（见 OBJ_POSE 处的说明）
+        place_tcp.pose.position.x = OBJ_POSE[0]
+        place_tcp.pose.position.y = OBJ_POSE[1]
         # 先抬到放置点上方 LIFT_DISTANCE 处再下压：关节空间搬运时方块离台面
-        # 足够高，不会一路刮着桌面过去。默认 PLACE_XYZ 与抓取点相同，此时
+        # 足够高，不会一路刮着桌面过去。原位放回时 xy 与抓取点相同，此时
         # 这一段就是纯竖直上移，路径必然无碰撞。
         place_tcp.pose.position.z = GRASP_TCP_Z + LIFT_DISTANCE
         place_tcp.pose.orientation.w = 1.0
@@ -551,7 +698,7 @@ def main():
         #       Failing stage(s): move to place (0/13): GOAL_STATE_INVALID
         #     —— 13 条输入全灭，看起来像「目标不可达」，其实是调用方式错了。
         #     别用 /compute_ik 去验这个目标：笛卡尔分支压根不做 IK。
-        #     默认 PLACE_XYZ 与抓取点相同时，这一段就是竖直上移 LIFT_DISTANCE，
+        #     原位放回时 xy 与抓取点相同，这一段就是竖直上移 LIFT_DISTANCE，
         #     与抬起的路径重合，稳。
         transport = stages.MoveTo('move to place', cartesian)
         transport.group = ARM_GROUP
