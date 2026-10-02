@@ -14,7 +14,11 @@
 采样期间另开一个终端发目标（见 docs/使用说明书.md 5.7 的 /move_action 例子）。
 CSV 每行：t, ref_*, fb_*, err_*, act_*（act = /joint_states 的真实位置；
 本机 ref_* 与 fb_* 是空的，所以用 ref ≈ act + err 反推）
-"""
+
+启动时会先校验 /arm_controller/state 与 /joint_states 的**发布者数量**，
+并打印控制器的关节顺序。发布者不是 1 时采到的数据不可信 —— 两份仿真
+同时跑会交替发布，误差"线性累积"可以完全是拼出来的假象
+（docs/踩坑记录.md 第 31、32 条）。"""
 
 import csv
 import sys
@@ -50,6 +54,7 @@ class Tracer(Node):
         self.samples = 0
         # 控制器顺序可能与 URDF 顺序不同，所以按名字重新排一遍
         self._order = None
+        self.joint_names = None    # 控制器自己的关节顺序（给日志里的 joint N 对照用）
         self._actual = {}          # 最近一帧 /joint_states 的真实位置（按名字）
         self.create_subscription(
             JointTrajectoryControllerState, '/arm_controller/state', self._cb, 100)
@@ -63,6 +68,9 @@ class Tracer(Node):
 
     def _idx(self, names):
         if self._order is None:
+            # 记下控制器的关节顺序：控制器日志里的 "joint N" 就是这个表的索引，
+            # 而它和 /joint_states 的顺序不一定一样，按后者数会数错关节。
+            self.joint_names = list(names)
             self._order = [names.index(j) if j in names else None for j in JOINTS]
         return self._order
 
@@ -106,6 +114,29 @@ def main():
 
     rclpy.init()
     node = Tracer(path)
+
+    # 采样前先自证"环境是唯一的"。
+    # 发布者不是 1 时，采到的数据不可信：两份仿真会交替发布，
+    # "参考值正常推进、实际值一动不动、误差线性累积"这种看上去极其干净的
+    # 模式，可以完全是两份消息拼出来的（踩坑记录第 31、32 条）。
+    t0 = time.time()
+    while time.time() - t0 < 10.0:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        if node.samples:
+            break
+    for topic in ('/arm_controller/state', '/joint_states'):
+        try:
+            n = len(node.get_publishers_info_by_topic(topic))
+        except Exception:
+            n = -1
+        print('[检查] %-24s 发布者 %s 个%s'
+              % (topic, n, '' if n == 1 else '   <-- 不是 1，先停掉多余仿真再采'))
+    if node.samples == 0:
+        print('[检查] 10 s 内没收到控制器状态：仿真在跑吗？话题名对吗？')
+    if node.joint_names:
+        print('[检查] 控制器关节顺序（日志里的 joint N 就是这个表的索引）：'
+              + '  '.join('%d=%s' % (i, j) for i, j in enumerate(node.joint_names)))
+
     t0 = time.time()
     while time.time() - t0 < duration:
         rclpy.spin_once(node, timeout_sec=0.05)
