@@ -28,6 +28,11 @@ moveit_simple_controller_manager:
   arm_controller:
     type: FollowJointTrajectory
     action_ns: follow_joint_trajectory
+    # default 只能有一个：它表示「轨迹没有明确指定控制器时用谁」。
+    # 两个控制器都标 default 会冲突，实测表现为 MTC 解里的
+    # TrajectoryExecutionInfo.controller_names 全是空、move_group 只能自己猜，
+    # 结果把一条 0 点的空轨迹先发给了 arm_controller，JTC 直接
+    # "Goal request rejected"，而 move_group 侧几乎不打印为什么。
     default: true
     joints:
       - top_plate_joint
@@ -36,9 +41,10 @@ moveit_simple_controller_manager:
       - wrist_joint
       - claw_base_joint
 
+  # 夹爪已经改成 JointTrajectoryController（见 arm_bringup/config/
+  # arm_controllers.yaml 里的说明），这里跟着改，别再按 GripperCommand 写。
   gripper_controller:
-    type: GripperCommand
-    action_ns: gripper_cmd
-    default: true
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
     joints:
       - right_claw_joint

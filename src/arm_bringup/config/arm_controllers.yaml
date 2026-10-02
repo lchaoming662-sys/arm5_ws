@@ -24,12 +24,13 @@ controller_manager:
       type: joint_trajectory_controller/JointTrajectoryController
 
     gripper_controller:
-      type: position_controllers/GripperActionController
+      type: joint_trajectory_controller/JointTrajectoryController
 
 
 # ----------------------------------------------------------------------------
 # 夹爪
-      type: position_controllers/GripperActionController
+# 【已修】这里原有一行孤立缩进的 type（属于注释区、没有父键），
+# 与上面 controller_manager 下真正的声明同名，会静默覆盖它。
 
 
 # ----------------------------------------------------------------------------
@@ -100,9 +101,35 @@ arm_controller:
 #    -0.90  = 闭合到底（限位；再转到 -0.93 两指面才刚好接触）
 #   所以「闭合」是往【负值】走，正值会被限位顶住。
 # ----------------------------------------------------------------------------
+# 为什么用 JointTrajectoryController 而不用 GripperActionController：
+#
+#   1) gz_ros2_control 只在【控制器申领接口】时才把关节的控制方式置成 POSITION。
+#      首次激活那一轮实测没置上，关节因此完全不动（速度指令恒为 0）。
+#      修法是让控制器重新申领一次（见 arm_bringup/scripts/wait_for_controllers.py
+#      的 --reactivate）。
+#   2) 但 GripperActionController 在 on_init 里就把命令句柄缓存下来了，
+#      重新申领之后它写的是**失效的旧句柄** —— 命令写了，关节还是不动。
+#      JointTrajectoryController 每次 on_activate 都重新绑定接口，所以活得下来。
+#
+# 副作用与对策：JTC 到不了目标位置就会报 GOAL_TOLERANCE_VIOLATED，
+#   而"夹住工件后手指停住"恰恰是到不了。所以闭合角必须按几何给到
+#   【刚好压住但不硬顶】的量（见 o5_2_arm.srdf 的 close 预设姿态）。
+#
+# 注意：本控制器只控 right_claw_joint。left_claw_joint 的联动由
+#   arm_core.xacro 的 <mimic> 负责（仿真侧由 gz_ros2_control 的 mimic 机制实现），
+#   不要写进 joints —— 写了会让两个手指各转各的。
 gripper_controller:
   ros__parameters:
-    joint: right_claw_joint
+    joints:
+      - right_claw_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    constraints:
+      goal: 0.02        # 终点容差（rad）。轻微压住方块时留出的余量
+      trajectory: 0.05  # 途中容差
 
     # ------------------------------------------------------------------------
     # 注意：allow_stalling 必须为 true —— 对抓取来说"停住"就是成功
@@ -117,7 +144,7 @@ gripper_controller:
     # 实测教训：默认值下夹到方块后 action 会 ABORT，**而且控制器会就此卡住**，
     # 之后不管两指之间有没有东西，关节都再不动一下（119 条采样速度峰值 0.0000），
     # 只能重启仿真才能恢复。所以这个参数不是可选的美化项。
-    allow_stalling: true
-    stall_timeout: 1.0                   # 停住多久算"夹稳了"（s）
-    stall_velocity_threshold: 0.001      # rad/s
-    goal_tolerance: 0.01
+#     allow_stalling: true
+#     stall_timeout: 1.0                   # 停住多久算"夹稳了"（s）
+#     stall_velocity_threshold: 0.001      # rad/s
+#     goal_tolerance: 0.01
