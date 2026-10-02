@@ -1,0 +1,44 @@
+# ============================================================================
+# ompl_planning.yaml — OMPL 规划器
+# ============================================================================
+# 这里只写"每个规划组能用哪些规划器"。
+# planner_configs（各规划器的具体参数）由 moveit_configs_utils 从
+# share/moveit_configs_utils/default_configs/ompl_defaults.yaml 自动合并进来——
+# 前提是本文件【不要】自己定义 planner_configs，否则就不会合并了。
+#
+# 可用的规划器名（来自 ompl_defaults.yaml）：
+#   AnytimePathShortening SBL EST LBKPIECE BKPIECE KPIECE RRT RRTConnect
+#   RRTstar TRRT PRM PRMstar FMT BFMT PDST STRIDE BiTRRT LBTRRT BiEST
+#   ProjEST LazyPRM LazyPRMstar SPARS SPARStwo
+# ============================================================================
+
+planning_plugin: ompl_interface/OMPLPlanner
+
+# 起点允许偏离当前状态多少（rad）。给 0 会因为浮点误差直接拒绝规划。
+start_state_max_bounds_error: 0.1
+
+request_adapters: >-
+  default_planner_request_adapters/AddTimeOptimalParameterization
+  default_planner_request_adapters/ResolveConstraintFrames
+  default_planner_request_adapters/FixWorkspaceBounds
+  default_planner_request_adapters/FixStartStateBounds
+  default_planner_request_adapters/FixStartStateCollision
+  default_planner_request_adapters/FixStartStatePathConstraints
+
+# 5 关节臂：默认用 RRTConnect（快、对高维/窄通道鲁棒），备选给几个对比用
+arm:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+    - RRT
+    - RRTstar
+    - PRM
+    - LBKPIECE
+    - EST
+
+# 夹爪是单自由度，RRT 就够
+gripper:
+  default_planner_config: RRTConnect
+  planner_configs:
+    - RRTConnect
+    - RRT

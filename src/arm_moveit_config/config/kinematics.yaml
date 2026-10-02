@@ -1,0 +1,34 @@
+# ============================================================================
+# kinematics.yaml — 逆运动学求解器
+# ============================================================================
+# 本机只装了 KDL（没有 pick_ik / trac_ik / bio_ik），所以只能用它。
+#
+# 注意：position_only_ik: true 是这条臂能用 MoveIt 的关键
+#
+#   本臂只有 5 个自由度（top_plate_joint..claw_base_joint）。KDL 默认要做【完整 6D 位姿】IK，
+#   5 自由度永远解不出来 —— 表现为 RViz 里拖目标位姿后 Plan 一直失败，
+#   报 "Unable to find a valid IK solution"，而且不告诉你为什么。
+#
+#   开启 position_only_ik 后，KDL 只用位置（3 个约束）参与求解，
+#   剩下的姿态自由度由它自行分配 —— 对抓取/取放这类任务足够用。
+#
+#   验证是否生效：
+#       ros2 service call /compute_ik moveit_msgs/srv/GetPositionIK \
+#         "{ik_request: {group_name: arm, ik_link_name: tcp, \
+#           pose_stamped: {header: {frame_id: world}, \
+#             pose: {position: {x: 0.027, y: 0.12, z: 0.25}, \
+#                    orientation: {w: 1.0}}}}}"
+# ============================================================================
+
+arm:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.05
+  kinematics_solver_attempts: 5
+  position_only_ik: true
+
+gripper:
+  kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
+  kinematics_solver_search_resolution: 0.005
+  kinematics_solver_timeout: 0.05
+  kinematics_solver_attempts: 5

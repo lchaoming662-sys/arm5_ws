@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: arm_description
+    relative_path: urdf/arm_gz.urdf.xacro
+  srdf:
+    relative_path: config/o5_2_arm.srdf
+  package_settings:
+    author_name: "黎超明"
+    author_email: "lchaoming662@gmail.com"
+    generated_timestamp: 1790947600

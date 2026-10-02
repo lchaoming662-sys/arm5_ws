@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<!--
+  inertial_macros.xacro — 惯量张量的宏（对齐 akabot 的写法）
+
+  ============================================================================
+  两组宏，按「你有没有 CAD 数据」选
+  ============================================================================
+
+  ① 几何近似组：box_inertia / cylinder_inertia
+     取自参考工程 akabot-main（akabot_description/urdf/inertial_macros.xacro）。
+     只需质量 + 边长/半径，按标准公式算惯量。适合手搭原型、没有 CAD 的时候。
+     注意：它会丢掉所有非对角项（ixy/ixz/iyz 一律置 0），对细长或偏心的连杆误差不小。
+
+  ② CAD 精确组：tensor_inertia
+     直接填 6 个分量，用于本工程的连杆 —— 它们的值来自 SolidWorks 装配体
+     （质量取材料属性、惯量由网格四面体积分，**不是包围盒近似**）。
+
+  本工程的臂连杆用 ②，不用 ①，是刻意的：
+    把已经有的精确张量换成 box 近似是**信息损失**，会改变动力学表现
+    （本工程的伺服速度/容差是按真实质量特性调出来的）。
+    ①仍然保留在文件里 —— 将来加新连杆（没有 CAD 数据）时可以直接用。
+
+  ============================================================================
+  单位约定：长度 m / 质量 kg / 惯量 kg·m²
+  注意：本工程的 STL 网格是**米**制，直接用即可；
+     akabot 的网格是毫米制，所以它的 visual/collision 上都写了
+     scale="0.0001 0.0001 0.0001"。换网格时注意这个差别。
+  ============================================================================
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ==========================================================================
+       ① 几何近似（来自 akabot）
+       ==========================================================================
+       公式出处：https://en.wikipedia.org/wiki/List_of_moments_of_inertia
+       两个宏都要求传一个 <origin> 子块（<xacro:insert_block name="origin"/>），
+       用 *origin 收集 —— 这是 xacro 的块参数语法，和普通 params 不同。
+       ========================================================================== -->
+  <xacro:macro name="box_inertia" params="mass length width height *origin">
+    <inertial>
+      <xacro:insert_block name="origin"/>
+      <mass value="${mass}"/>
+      <inertia ixx="${(mass/12) * (width*width + height*height)}" ixy="0.0" ixz="0.0"
+               iyy="${(mass/12) * (length*length + height*height)}" iyz="0.0"
+               izz="${(mass/12) * (length*length + width*width)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertia" params="mass length radius *origin">
+    <inertial>
+      <xacro:insert_block name="origin"/>
+      <mass value="${mass}"/>
+      <inertia ixx="${(1/12) * mass * (3*radius*radius + length*length)}" ixy="0.0" ixz="0.0"
+               iyy="${(1/12) * mass * (3*radius*radius + length*length)}" iyz="0.0"
+               izz="${(1/2) * mass * (radius*radius)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- ==========================================================================
+       ② CAD 精确张量（本工程用）
+       ==========================================================================
+       params:
+           mass     质量 kg
+           com      质心，相对连杆原点 "x y z"
+           inertia  6 分量张量 "ixx ixy ixz iyy iyz izz"
+       注意：顺序不要写错：ixx ixy ixz iyy iyz izz（不是按矩阵行优先）。
+       ========================================================================== -->
+  <xacro:macro name="tensor_inertia" params="mass com inertia">
+    <inertial>
+      <origin xyz="${com}" rpy="0 0 0"/>
+      <mass value="${mass}"/>
+      <inertia ixx="${inertia.split(' ')[0]}" ixy="${inertia.split(' ')[1]}"
+               ixz="${inertia.split(' ')[2]}" iyy="${inertia.split(' ')[3]}"
+               iyz="${inertia.split(' ')[4]}" izz="${inertia.split(' ')[5]}"/>
+    </inertial>
+  </xacro:macro>
+
+</robot>

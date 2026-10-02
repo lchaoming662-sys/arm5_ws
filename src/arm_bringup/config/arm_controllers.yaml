@@ -1,0 +1,123 @@
+# ============================================================================
+# arm_controllers.yaml — controller_manager 参数
+# ============================================================================
+# 读取者：gz_ros2_control 的系统插件
+#         路径写在 arm_description/urdf/arm_gz.urdf.xacro 的 <parameters> 里
+#
+# 声明 3 个控制器：
+#   joint_state_broadcaster   从物理引擎读真实关节状态，发 /joint_states
+#   arm_controller            5 关节臂轨迹控制器（top_plate_joint..claw_base_joint）
+#   gripper_controller        夹爪（GripperActionController）
+#
+# 注意：关节名的拼写与顺序必须与 arm_core.xacro 完全一致。
+#    顺序错了机械臂会「跟着一个置换走」——看起来能动，但动的是错的关节。
+# ============================================================================
+
+controller_manager:
+  ros__parameters:
+    update_rate: 100          # 控制频率 100 Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    gripper_controller:
+      type: position_controllers/GripperActionController
+
+
+# ----------------------------------------------------------------------------
+# 夹爪
+      type: position_controllers/GripperActionController
+
+
+# ----------------------------------------------------------------------------
+# 5 关节臂
+# ----------------------------------------------------------------------------
+arm_controller:
+  ros__parameters:
+    joints:
+      - top_plate_joint
+      - lower_arm_joint
+      - upper_arm_joint
+      - wrist_joint
+      - claw_base_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_partial_joints_goal: false
+    allow_nonzero_velocity_at_trajectory_end: false
+    # ------------------------------------------------------------------------
+    # 容差：trajectory = 运动**途中**允许的偏差，goal = **终点**允许的偏差
+    # ------------------------------------------------------------------------
+    # 这两个数不是随便填的，实测关系如下（详见 docs/踩坑记录.md「速度与容差」）：
+    #
+    #   gz_ros2_control 的位置接口背后是一套**软位置伺服**，跟动参考时会留下
+    #   一个与速度成正比的恒定滞后。实测（MoveIt 速度缩放 = s）：
+    #
+    #       s = 0.15  →  峰值跟踪误差 0.030 rad
+    #       s = 0.20  →  0.040 rad
+    #       s = 0.25  →  0.050 rad
+    #       （近似 误差 ≈ 0.20 × s）
+    #
+    #   也就是说这个滞后是**被控对象的固有特性，不是故障**。原来把 trajectory
+    #   卡在 0.05 rad 的结果是：速度缩放到 0.25 就必然被 ABORT 掐断，
+    #   报 "path tolerance violation"，而机械臂其实走得好好的。
+    #
+    #   所以 trajectory 放到 0.12 rad（6.9°），给"速度快一档"留出余量；
+    #   goal 保持 0.02 rad（1.1°）不动 —— 终点精度不能松，
+    #     "走得慢一点没关系，但必须停在正确位置上"。
+    #
+    # 注意：0.12 rad 仍然是有效的故障网：真撞上东西（或者关节被顶住）
+    #    偏差会远超 0.12 rad，照样会被掐断。
+    constraints:
+      goal_time: 1.0                     # 到终点后允许 1.0 s 收敛
+      stopped_velocity_tolerance: 0.1    # rad/s
+      top_plate_joint: {trajectory: 0.12, goal: 0.02}
+      lower_arm_joint: {trajectory: 0.12, goal: 0.02}
+      upper_arm_joint: {trajectory: 0.12, goal: 0.02}
+      wrist_joint: {trajectory: 0.12, goal: 0.02}
+      claw_base_joint: {trajectory: 0.12, goal: 0.02}
+
+
+# ----------------------------------------------------------------------------
+# 夹爪 —— 只控「主动指」，从动指由 URDF 的 <mimic> 自动跟随
+#
+# 为什么用 GripperActionController 而不是 JointTrajectoryController：
+#   夹爪的语义是「张开 / 闭合」，用 /gripper_controller/gripper_cmd 这个 action
+#   发一个目标位置就够了，不需要编一条轨迹。
+#   （这也是参考工程 akabot 与手册的写法。）
+#
+# 注意：这里只写 right_claw_joint —— 不要写成数组、也不要加
+#    left_claw_joint：GripperActionController 是单关节控制器，
+#    从动指的正确联动位置在 arm_core.xacro 的 <mimic> 里，不在本文件。
+#
+# 角度语义（见 arm_core.xacro「夹爪方案」）：
+#     0.0   = 竖直张开位（两指夹持面间距 29.3 mm）
+#    -0.90  = 闭合到底（限位；再转到 -0.93 两指面才刚好接触）
+#   所以「闭合」是往【负值】走，正值会被限位顶住。
+# ----------------------------------------------------------------------------
+gripper_controller:
+  ros__parameters:
+    joint: right_claw_joint
+
+    # ------------------------------------------------------------------------
+    # 注意：allow_stalling 必须为 true —— 对抓取来说"停住"就是成功
+    # ------------------------------------------------------------------------
+    # GripperActionController 的语义：
+    #     allow_stalling = false（默认）: 手指没走到指令位置 = 失败，action 直接 ABORT
+    #     allow_stalling = true         : 手指被东西挡住停下来 = 正常结束
+    #
+    # 抓取的物理事实就是「手指压到工件就再也走不动了」——用默认的 false，
+    # 每一次成功抓取都会被判成一次失败。
+    #
+    # 实测教训：默认值下夹到方块后 action 会 ABORT，**而且控制器会就此卡住**，
+    # 之后不管两指之间有没有东西，关节都再不动一下（119 条采样速度峰值 0.0000），
+    # 只能重启仿真才能恢复。所以这个参数不是可选的美化项。
+    allow_stalling: true
+    stall_timeout: 1.0                   # 停住多久算"夹稳了"（s）
+    stall_velocity_threshold: 0.001      # rad/s
+    goal_tolerance: 0.01

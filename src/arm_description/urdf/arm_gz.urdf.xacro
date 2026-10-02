@@ -1,0 +1,86 @@
+<?xml version="1.0"?>
+<!--
+  arm_gz.urdf.xacro — 仿真用总装（Gazebo Fortress）
+
+  这是「配置层」：把纯模型 + 相机 + ros2_control 接口拼起来，
+  再挂上 Gazebo 需要的插件与接触参数。
+
+  ============================================================================
+  四段结构
+  ============================================================================
+      1. 引入显示总装（已含 arm_core + arm_camera）
+      2. 引入 ros2_control 接口声明
+      3. 实例化接口，硬件插件传 Fortress 的实现
+      4. 挂 gz_ros2_control 系统插件（controller_manager 由此诞生）
+
+  ============================================================================
+  展开验证
+  ============================================================================
+      xacro arm_gz.urdf.xacro > /tmp/arm_gz.urdf && check_urdf /tmp/arm_gz.urdf
+
+      期望 7 个关节，每个 1 个 command + 2 个 state，合计 7 / 14。
+      注意：别用 grep -c 直接数标签：本注释里也含有这些字符串，会被算进去。
+      要数请按关节看，例如：
+          grep -A3 '<joint name=' /tmp/arm_gz.urdf
+          ros2 control list_hardware_interfaces     # 跑起来之后更直接
+-->
+<robot name="o5_2_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 1. 纯模型 + 相机 -->
+  <xacro:include filename="$(find arm_description)/urdf/arm.urdf.xacro"/>
+
+  <!-- 2. ros2_control 接口声明（只是声明，不含硬件实现） -->
+  <xacro:include filename="$(find arm_description)/urdf/arm.ros2_control.xacro"/>
+
+  <!-- 3. 实例化接口：仿真侧的硬件插件是 gz_ros2_control/GazeboSimSystem
+         （它内部保留了 ign_ros2_control/IgnitionSystem 的兼容别名） -->
+  <xacro:arm_ros2_control name="ArmSystem"
+                          plugin_name="gz_ros2_control/GazeboSimSystem"/>
+
+  <!-- 4. 让 Gazebo 加载 ros2_control 系统插件。
+         controller_manager 节点就是由这个插件在仿真进程内注册的，
+         所以外部不要再起 ros2_control_node，否则会撞名。 -->
+  <gazebo>
+    <plugin filename="gz_ros2_control-system"
+            name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      <parameters>$(find arm_bringup)/config/arm_controllers.yaml</parameters>
+    </plugin>
+  </gazebo>
+
+  <!-- ==========================================================================
+       Gazebo 侧接触 / 摩擦参数
+
+       注意：这一段不属于「模型本体」，是物理引擎的调参，所以放在仿真总装里，
+          不放进 arm_core.xacro。
+
+           mu1/mu2      静/动摩擦系数
+           kp/kd        接触刚度 / 阻尼（1e6 / 100 可避免接触被"解算掉"而穿透）
+           minDepth     允许的最小穿透深度 1 mm
+           maxVel       接触修正的最大速度
+           selfCollide  关闭自碰撞（本模型连杆间隙小，开启会误报）
+
+           手指摩擦系数特意取 1.50（高于臂身的 0.90），这样夹持时才有
+           足够摩擦力抓住目标。
+       ========================================================================== -->
+  <xacro:macro name="arm_contact" params="link mu:=0.90">
+    <gazebo reference="${link}">
+      <mu1>${mu}</mu1>
+      <mu2>${mu}</mu2>
+      <kp>1000000</kp>
+      <kd>100</kd>
+      <minDepth>0.001</minDepth>
+      <maxVel>0.01</maxVel>
+      <selfCollide>false</selfCollide>
+    </gazebo>
+  </xacro:macro>
+
+  <xacro:arm_contact link="base_plate"/>
+  <xacro:arm_contact link="top_plate"/>
+  <xacro:arm_contact link="lower_arm"/>
+  <xacro:arm_contact link="upper_arm"/>
+  <xacro:arm_contact link="wrist"/>
+  <xacro:arm_contact link="claw_base"/>
+  <xacro:arm_contact link="right_claw" mu="1.50"/>
+  <xacro:arm_contact link="left_claw" mu="1.50"/>
+
+</robot>

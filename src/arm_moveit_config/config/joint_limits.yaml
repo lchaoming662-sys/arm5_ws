@@ -1,0 +1,66 @@
+# ============================================================================
+# joint_limits.yaml — 速度 / 加速度限位
+# ============================================================================
+# URDF 里只声明了位置与速度上限（臂关节 3.0 rad/s），没有加速度；
+# MoveIt 需要加速度才能做时间参数化。这里补上，并把速度压得比 URDF 保守。
+#
+# 注意：这里给的是**仿真用值**，与 MG996R 的真实能力无关。
+#
+# ---------------------------------------------------------------------------
+# 为什么不是越小越安全
+# ---------------------------------------------------------------------------
+# 实际速度 = max_velocity × 请求里的 max_velocity_scaling_factor
+# 实际加速度 = max_acceleration × 请求里的 max_acceleration_scaling_factor
+#
+# 早期为了"稳"把两边都压到 0.2，结果是：实际只有 0.24 rad/s、0.2 rad/s²，
+# 动 1 rad 要 3 秒以上；再乘上本机 RTF ~0.15，一次抓取要跑好几分钟。
+# 这个臂的仿真驱动（gz_ros2_control 的位置伺服）是够力气的，压这么低纯属浪费。
+#
+# 注意：提速的**风险**在 JointTrajectoryController 的容差（arm_controllers.yaml）：
+#    跟得越快、滞后越大，一旦超过 trajectory 容差就会被 ABORT 掐断，
+#    报 "path tolerance violation"。所以提速后必须实测跟踪误差，
+#    不能只看"命令发出去了"。
+# ============================================================================
+
+# 每次规划默认用到限位的比例（请求里再乘一次 scaling factor）
+default_velocity_scaling_factor: 0.5
+default_acceleration_scaling_factor: 0.5
+
+joint_limits:
+  top_plate_joint:
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: true
+    max_acceleration: 3.0
+  lower_arm_joint:
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: true
+    max_acceleration: 3.0
+  upper_arm_joint:
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: true
+    max_acceleration: 3.0
+  wrist_joint:
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: true
+    max_acceleration: 3.0
+  claw_base_joint:
+    has_velocity_limits: true
+    max_velocity: 2.0
+    has_acceleration_limits: true
+    max_acceleration: 3.0
+
+  # 夹爪限位区间只有 0.9 rad，速度给大了容易冲过方块。保持保守。
+  right_claw_joint:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: true
+    max_acceleration: 0.3
+  left_claw_joint:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: true
+    max_acceleration: 0.3

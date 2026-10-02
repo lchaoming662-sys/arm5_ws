@@ -1,0 +1,40 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.1
+      Plane Cell Count: 30
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+      Visual Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 0.1
+      Show Names: false
+  Global Options:
+    # 模型根节点是 world（arm_core.xacro 里的静态世界锚），
+    # 所以这里用 world 当固定坐标系——网格就是机械臂真正站立的地面。
+    # 也可以改成 base_link，两者之间只有一个固定关节。
+    Fixed Frame: world
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Interact
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 0.75
+      Focal Point:
+        X: 0.03
+        Y: 0.09
+        Z: 0.10
+      Pitch: 0.27
+      Yaw: -0.962

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  o5_2_arm.srdf — MoveIt 的语义描述（Semantic Robot Description Format）
+
+  URDF 只说"机器人长什么样"，SRDF 补上"哪些关节一起规划、哪些连杆不用互查碰撞"。
+  两者都必要。
+
+  手写而非用 MoveIt Setup Assistant 生成，理由：可复现、可 diff、可进版本库。
+
+  ============================================================================
+  规划组
+  ============================================================================
+  arm       链路 base_link → tcp，即 top_plate_joint..claw_base_joint + 固定的 tcp_joint。
+            末端特意取 tcp 而不是 claw_base：腕离真正的抓取点差 95.925 mm，
+              拿腕当末端做位姿规划，规划的是腕的位置而不是抓取点的位置。
+
+  gripper   只有主动指 right_claw_joint。
+            从动指 left_claw_joint 是 URDF 里的 <mimic>，
+            由 RobotModel 自动跟随，不进任何组、不参与规划。
+
+  ============================================================================
+  碰撞矩阵（<disable_collisions>）
+  ============================================================================
+  注意：这一段不能省。MoveIt 默认【检查所有连杆对】，包括用关节直接相连的相邻对。
+     而本模型的腕部相机碰撞盒就套在 claw_base 原点附近，和 claw_base 的网格必然重叠——
+     不显式禁用相邻对，MoveIt 会把"模型天生就在碰撞"，任何规划都起不来。
+
+  只列相邻对（reason="Adjacent"）和确定永不碰撞的对（reason="Never"）；
+  其余非相邻对【保持检查】——那是正确的，我们本来就要它避开自碰撞姿态。
+  ============================================================================
+-->
+<robot name="o5_2_arm">
+
+  <!-- ======================== 规划组 ======================== -->
+
+  <group name="arm">
+    <chain base_link="base_link" tip_link="tcp"/>
+  </group>
+
+  <group name="gripper">
+    <joint name="right_claw_joint"/>
+  </group>
+
+  <!-- ======================== 预设姿态 ========================
+       grasp_ready 的数值来自 tools/solve_grasp_poses.py 解出的「预抓取位形」，
+       和 tools/pick_demo.py 里的 PREGRASP 是同一组，方便规划→抓取衔接。
+       ======================================================== -->
+
+  <group_state name="home" group="arm">
+    <joint name="top_plate_joint" value="0"/>
+    <joint name="lower_arm_joint" value="0"/>
+    <joint name="upper_arm_joint" value="0"/>
+    <joint name="wrist_joint" value="0"/>
+    <joint name="claw_base_joint" value="0"/>
+  </group_state>
+
+  <group_state name="grasp_ready" group="arm">
+    <joint name="top_plate_joint" value="0"/>
+    <joint name="lower_arm_joint" value="-0.0385"/>
+    <joint name="upper_arm_joint" value="-0.1531"/>
+    <joint name="wrist_joint" value="-1.55"/>
+    <joint name="claw_base_joint" value="0"/>
+  </group_state>
+
+  <group_state name="open" group="gripper">
+    <joint name="right_claw_joint" value="0"/>
+  </group_state>
+
+  <group_state name="close" group="gripper">
+    <joint name="right_claw_joint" value="-0.20"/>
+  </group_state>
+
+  <!-- ======================== 碰撞矩阵 ======================== -->
+
+  <!-- 相邻对：用关节直接相连，永远互相"贴着"，必须禁用 -->
+  <disable_collisions link1="world" link2="base_link" reason="Adjacent"/>
+  <disable_collisions link1="base_link" link2="base_plate" reason="Adjacent"/>
+  <disable_collisions link1="base_plate" link2="top_plate" reason="Adjacent"/>
+  <disable_collisions link1="top_plate" link2="lower_arm" reason="Adjacent"/>
+  <disable_collisions link1="lower_arm" link2="upper_arm" reason="Adjacent"/>
+  <disable_collisions link1="upper_arm" link2="wrist" reason="Adjacent"/>
+  <disable_collisions link1="wrist" link2="claw_base" reason="Adjacent"/>
+  <disable_collisions link1="claw_base" link2="right_claw" reason="Adjacent"/>
+  <disable_collisions link1="claw_base" link2="left_claw" reason="Adjacent"/>
+  <disable_collisions link1="claw_base" link2="tcp" reason="Adjacent"/>
+  <disable_collisions link1="claw_base" link2="wrist_cam_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_cam_link" link2="wrist_cam_optical_frame" reason="Adjacent"/>
+
+  <!-- 无碰撞几何的纯坐标系连杆：不参与碰撞检查 -->
+  <disable_collisions link1="tcp" link2="base_link" reason="Never"/>
+  <disable_collisions link1="tcp" link2="base_plate" reason="Never"/>
+  <disable_collisions link1="tcp" link2="top_plate" reason="Never"/>
+  <disable_collisions link1="tcp" link2="lower_arm" reason="Never"/>
+  <disable_collisions link1="tcp" link2="upper_arm" reason="Never"/>
+  <disable_collisions link1="tcp" link2="wrist" reason="Never"/>
+  <disable_collisions link1="tcp" link2="right_claw" reason="Never"/>
+  <disable_collisions link1="tcp" link2="left_claw" reason="Never"/>
+  <disable_collisions link1="tcp" link2="wrist_cam_link" reason="Never"/>
+  <disable_collisions link1="tcp" link2="wrist_cam_optical_frame" reason="Never"/>
+  <disable_collisions link1="tcp" link2="world" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="world" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="base_link" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="base_plate" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="top_plate" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="lower_arm" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="upper_arm" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="wrist" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="right_claw" reason="Never"/>
+  <disable_collisions link1="wrist_cam_optical_frame" link2="left_claw" reason="Never"/>
+
+  <!-- 两指：限位区间最多转到 0.9 rad，夹持面仍留 0.9 mm 余量，永不接触 -->
+  <disable_collisions link1="right_claw" link2="left_claw" reason="Never"/>
+
+</robot>

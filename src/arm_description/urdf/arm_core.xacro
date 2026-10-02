@@ -1,0 +1,390 @@
+<?xml version="1.0"?>
+<!--
+  arm_core.xacro — O5-2 五自由度桌面机械臂 · 纯模型
+
+  ============================================================================
+  这个文件里只有「模型」，没有「配置」
+  ============================================================================
+
+  包含：
+      · 运动学参数（关节原点、关节轴线）
+      · 关节限位与动力学（damping / friction）
+      · 8 个连杆的质量 / 质心 / 惯量张量
+      · 8 个实体连杆 + 7 个关节（5 个臂关节 + 夹爪两指，从动指 mimic）
+      · TCP 坐标系（两指夹持面中点，供规划/抓取使用）
+      · 材质颜色
+      · 3 类宏：两种连杆（mesh 碰撞 / box 碰撞）、旋转关节
+      · 世界锚定（world -> base_link 固定关节）
+
+  刻意不包含（这些属于「配置」，在别的包里）：
+      · Gazebo 插件、接触/摩擦参数        -> 需要时由 arm_gz.urdf.xacro 挂
+      · ros2_control 硬件接口             -> arm.ros2_control.xacro
+      · controller_manager 参数           -> arm_bringup/config/arm_controllers.yaml
+      · 相机                              -> arm_camera.xacro
+
+  所以本文件可以单独展开成一个合法 URDF，直接喂给 robot_state_publisher：
+      xacro arm_core.xacro > /tmp/arm.urdf && check_urdf /tmp/arm.urdf
+
+  ============================================================================
+  命名约定（对齐参考工程 akabot）
+  ============================================================================
+  连杆与关节都用**语义名**，不用 top_plate/top_plate_joint 这种编号：
+
+      base_plate   底板            top_plate_joint   底座回转
+      top_plate    回转平台        lower_arm_joint   肩部俯仰
+      lower_arm    大臂            upper_arm_joint   肘部
+      upper_arm    小臂            wrist_joint       腕俯仰
+      wrist        腕              claw_base_joint   腕回转
+      claw_base    夹爪底座        right_claw_joint  主动指（控制器只驱它）
+      right_claw   主动指          left_claw_joint   从动指（mimic × -1）
+      left_claw    从动指
+
+  关节的父/子关系与 akabot 一一对应：
+      base_link → base_plate → top_plate → lower_arm → upper_arm → wrist → claw_base → 两指
+  只有世界锚定那一层不同：akabot 把 world→base_link 的固定关节命名为 `fixed`，
+  本工程叫 `world_base_link_joint`（`fixed` 这个名字在模型里太容易和"固定"语义混淆）。
+
+  惯量的写法也对齐 akabot：统一走 inertial_macros.xacro 的宏，
+  不再在连杆里内联手写 <inertia>。
+
+  ============================================================================
+  单位约定：长度 m / 角度 rad / 质量 kg / 惯量 kg·m²
+  数据来源：SolidWorks 装配体 Assem1.SLDASM
+            （质量取材料属性，惯量由网格四面体积分，非包围盒近似）
+  ============================================================================
+-->
+<robot name="o5_2_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 惯量宏。用相对路径 include，这样本文件从任何位置都能单独展开 -->
+  <xacro:include filename="inertial_macros.xacro"/>
+
+  <!-- ==========================================================================
+       一、运动学参数 —— 关节原点（相对父连杆）
+       ==========================================================================
+       child_origin = joint_absolute - parent_origin，由装配体绝对坐标换算。
+       连杆长度校验：34.2 -> 102.0 -> 97.5 -> 68.5 mm
+       ========================================================================== -->
+  <xacro:property name="top_plate_xyz" value=" 0.027037  0.073566  0.111677"/>  <!-- base_plate -> top_plate -->
+  <xacro:property name="lower_arm_xyz" value="-0.022766  0.013792 -0.021575"/>  <!-- top_plate  -> lower_arm -->
+  <xacro:property name="upper_arm_xyz" value="-0.000001  0.102000  0.000233"/>  <!-- lower_arm  -> upper_arm -->
+  <xacro:property name="wrist_xyz"     value="-0.000117  0.001961 -0.097505"/>  <!-- upper_arm  -> wrist -->
+  <xacro:property name="claw_base_xyz" value=" 0.023268 -0.021198 -0.060004"/>  <!-- wrist      -> claw_base -->
+  <xacro:property name="right_claw_xyz" value="-0.005843  0.006182 -0.082410"/> <!-- claw_base  -> 主动指 -->
+  <xacro:property name="left_claw_xyz"  value=" 0.004233  0.006188 -0.082440"/> <!-- claw_base  -> 从动指 -->
+
+  <!-- ==========================================================================
+       二、关节轴线
+
+       原始 SolidWorks 提取值带 0.177° 倾斜，这里已吸附到理想轴。
+       该倾角在 215 mm 力臂上只造成 0.66 mm 偏移（肉眼不可见），
+       且 MG996R 输出齿配合间隙本身就有 0.2~0.5°，落在噪声内。
+       ========================================================================== -->
+  <xacro:property name="top_plate_axis" value="0 1 0"/>   <!-- 底座回转（因整体 +90° about X，等效世界 Z 轴） -->
+  <xacro:property name="lower_arm_axis" value="1 0 0"/>
+  <xacro:property name="upper_arm_axis" value="-1 0 0"/>  <!-- 与 lower_arm 反向，构成肘部 -->
+  <xacro:property name="wrist_axis"     value="1 0 0"/>
+  <xacro:property name="claw_base_axis" value="0 0 -1"/>  <!-- 腕部回转 -->
+  <!-- 夹爪两指都绕 Y 轴旋转（Y 垂直于「两指分开方向 X」与「手指伸出方向 Z」），
+      两指因此都在 XZ 平面内摆动，朝对侧咬合。
+      配合 mimic multiplier = -1，两指反向等量转动 = 对称开合。 -->
+  <xacro:property name="right_claw_axis" value="0 1 0"/>
+  <xacro:property name="left_claw_axis"  value="0 1 0"/>
+
+  <!-- ==========================================================================
+       三、关节限位与动力学
+
+       注意：effort / velocity 是「让 Gazebo 仿真跑得起来」的工程取值，
+          不是 MG996R 的硬件能力，不得用于评估负载或抓取力。
+       注意：damping / friction 只影响 Gazebo 物理，RViz 里不起作用；
+          它们顶不住重力（静止时阻尼力矩为 0），防下垂靠控制器闭环。
+       ========================================================================== -->
+  <xacro:property name="arm_joint_lower"    value="-1.5708"/>
+  <xacro:property name="arm_joint_upper"    value=" 1.5708"/>
+  <xacro:property name="arm_joint_effort"   value="10.0"/>
+  <xacro:property name="arm_joint_velocity" value="3.0"/>
+  <xacro:property name="arm_joint_damping"  value="0.10"/>
+  <xacro:property name="arm_joint_friction" value="0.05"/>
+
+  <!-- 夹爪：两个「绕轴旋转」的手指，单位 rad
+       注意：这里刻意不用 prismatic（平移）关节，理由见文件末尾「夹爪方案」一节。
+       0.0 = 竖直张开位（两指夹持面间距 29.3 mm）
+       负方向 = 闭合。限位取 0.90 rad 是算出来的：再转到 0.93 rad 两指面就
+       刚好接触，留 ~0.9 mm 余量避免碰撞求解器抖动。 -->
+  <xacro:property name="claw_angle_limit" value="0.90"/>
+  <xacro:property name="claw_effort"      value="20.0"/>
+  <xacro:property name="claw_velocity"    value="0.5"/>
+
+  <!-- ==========================================================================
+       四、物理参数（质量 / 质心 / 惯量张量）
+       惯量 6 分量顺序：ixx ixy ixz iyy iyz izz
+       整机质量约 453.9 g（不含相机）
+       ========================================================================== -->
+  <!-- base_plate：底板×2 + U 型支架 + 舵机 -->
+  <xacro:property name="base_plate_mass" value="0.143933"/>
+  <xacro:property name="base_plate_com"  value="0.025064 0.022051 0.112311"/>
+  <xacro:property name="base_plate_inertia"
+                  value="0.000126612 -0.000019091 -0.000000919 0.000126343 -0.000001582 0.000117666"/>
+
+  <!-- top_plate：U 型支架 + 舵机 + 舵盘 -->
+  <xacro:property name="top_plate_mass" value="0.046643"/>
+  <xacro:property name="top_plate_com"  value="0.005075 0.011879 -0.011367"/>
+  <xacro:property name="top_plate_inertia"
+                  value="0.000010852 0.000000018 0.000000001 0.000015620 0.000000108 0.000009424"/>
+
+  <!-- lower_arm：脚板×2 + 舵盘 -->
+  <xacro:property name="lower_arm_mass" value="0.046795"/>
+  <xacro:property name="lower_arm_com"  value="0.024278 0.050027 0.000189"/>
+  <xacro:property name="lower_arm_inertia"
+                  value="0.000044988 -0.000001104 -0.000000082 0.000030746 -0.000000095 0.000070850"/>
+
+  <!-- upper_arm：连接件 + U 型支架 + 脚板 + 舵机 + 舵盘 -->
+  <xacro:property name="upper_arm_mass" value="0.076498"/>
+  <xacro:property name="upper_arm_com"  value="0.026187 -0.001149 -0.029551"/>
+  <xacro:property name="upper_arm_inertia"
+                  value="0.000075951 0.000000103 -0.000002484 0.000093725 0.000003223 0.000026592"/>
+
+  <!-- wrist：U 型支架×2 + 舵机×2 + 舵盘 -->
+  <xacro:property name="wrist_mass" value="0.092393"/>
+  <xacro:property name="wrist_com"  value="0.030387 -0.014556 -0.016633"/>
+  <xacro:property name="wrist_inertia"
+                  value="0.000043585 0.000001605 0.000004130 0.000047614 -0.000006950 0.000029831"/>
+
+  <!-- claw_base：夹爪底座 + 齿轮×2 + 舵机 + 舵盘 + 销 -->
+  <xacro:property name="claw_base_mass" value="0.039722"/>
+  <xacro:property name="claw_base_com"  value="0.017716 -0.017188 -0.026802"/>
+  <xacro:property name="claw_base_inertia"
+                  value="0.000010477 0.000002797 -0.000000127 0.000011200 0.000000207 0.000016538"/>
+
+  <!-- 夹爪手指：手指板×2 + 连杆×2 -->
+  <xacro:property name="right_claw_mass" value="0.003953"/>
+  <xacro:property name="right_claw_com"  value="-0.012800 -0.004503 0.006606"/>
+  <xacro:property name="right_claw_inertia"
+                  value="0.000001276 -0.000000000 -0.000000131 0.000001545 -0.000000001 0.000000328"/>
+
+  <xacro:property name="left_claw_mass" value="0.003953"/>
+  <xacro:property name="left_claw_com"  value="0.013221 -0.004487 0.006543"/>
+  <xacro:property name="left_claw_inertia"
+                  value="0.000001279 -0.000000000 0.000000108 0.000001525 -0.000000001 0.000000306"/>
+
+  <!-- ==========================================================================
+       五、夹爪碰撞体
+       视觉仍用 STL 网格，碰撞体用 box 近似夹持面（12×12×37 mm）。
+       理由：网格碰撞在物理引擎里既慢又在薄壁上不稳，box 更可控。
+       ========================================================================== -->
+  <xacro:property name="right_claw_col_origin" value="-0.015500 -0.004500 -0.013500"/>
+  <xacro:property name="left_claw_col_origin"  value=" 0.015700 -0.004500 -0.013500"/>
+  <xacro:property name="claw_col_size"         value=" 0.012000  0.012000  0.037000"/>
+
+  <!-- ==========================================================================
+       六、材质颜色（RViz 显示用）
+       ========================================================================== -->
+  <xacro:property name="color_base_plate" value="0.35 0.38 0.42 1.0"/>
+  <xacro:property name="color_top_plate"  value="0.30 0.45 0.62 1.0"/>
+  <xacro:property name="color_lower_arm"  value="0.62 0.35 0.35 1.0"/>
+  <xacro:property name="color_upper_arm"  value="0.35 0.55 0.38 1.0"/>
+  <xacro:property name="color_wrist"      value="0.55 0.45 0.30 1.0"/>
+  <xacro:property name="color_claw_base"  value="0.45 0.42 0.50 1.0"/>
+  <xacro:property name="color_claw"       value="0.45 0.62 0.55 1.0"/>
+
+  <material name="base_plate_color"><color rgba="${color_base_plate}"/></material>
+  <material name="top_plate_color"><color rgba="${color_top_plate}"/></material>
+  <material name="lower_arm_color"><color rgba="${color_lower_arm}"/></material>
+  <material name="upper_arm_color"><color rgba="${color_upper_arm}"/></material>
+  <material name="wrist_color"><color rgba="${color_wrist}"/></material>
+  <material name="claw_base_color"><color rgba="${color_claw_base}"/></material>
+  <material name="claw_color"><color rgba="${color_claw}"/></material>
+
+  <!-- ==========================================================================
+       七、坐标系基准
+       ==========================================================================
+
+       world      —— 世界静止系。Gazebo 里一个叫 world 的 link 会被当作静态世界，
+                    于是机械臂被钉在原地，不会被反作用力推着漂移。
+       base_link  —— 空壳根节点，本身没有任何几何。
+       base_plate —— 真正的基座。
+
+       为什么中间要夹一层 base_link + 固定关节：
+          原始 CAD 装配体是 Y-up 的（top_plate_joint 绕 +Y 旋转），
+          而 RViz / Gazebo 都要求 Z-up。
+          用一个固定关节整体旋转，mesh / collision / inertia /
+          所有子关节的变换一次性继承，不必逐一改。
+       ========================================================================== -->
+  <link name="world"/>
+
+  <joint name="world_base_link_joint" type="fixed">
+    <parent link="world"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_link"/>
+
+  <joint name="base_plate_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="base_plate"/>
+    <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+  </joint>
+
+  <!-- ==========================================================================
+       八、通用宏
+       ========================================================================== -->
+
+  <!-- 连杆：mesh 视觉 + mesh 碰撞 + CAD 精确惯量（走 inertial_macros 的 tensor_inertia） -->
+  <xacro:macro name="arm_link" params="name mesh_file color mass com inertia">
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><mesh filename="package://arm_description/meshes/${mesh_file}"/></geometry>
+        <material name="${color}"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><mesh filename="package://arm_description/meshes/${mesh_file}"/></geometry>
+      </collision>
+      <xacro:tensor_inertia mass="${mass}" com="${com}" inertia="${inertia}"/>
+    </link>
+  </xacro:macro>
+
+  <!-- 连杆：mesh 视觉 + box 碰撞（夹爪手指用） -->
+  <xacro:macro name="arm_link_boxcollision"
+               params="name mesh_file color mass com inertia col_origin col_size">
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><mesh filename="package://arm_description/meshes/${mesh_file}"/></geometry>
+        <material name="${color}"/>
+      </visual>
+      <collision>
+        <origin xyz="${col_origin}" rpy="0 0 0"/>
+        <geometry><box size="${col_size}"/></geometry>
+      </collision>
+      <xacro:tensor_inertia mass="${mass}" com="${com}" inertia="${inertia}"/>
+    </link>
+  </xacro:macro>
+
+  <!-- 旋转关节 -->
+  <xacro:macro name="arm_revolute_joint" params="name parent child origin axis">
+    <joint name="${name}" type="revolute">
+      <parent link="${parent}"/>
+      <child  link="${child}"/>
+      <origin xyz="${origin}" rpy="0 0 0"/>
+      <axis xyz="${axis}"/>
+      <limit lower="${arm_joint_lower}" upper="${arm_joint_upper}"
+             effort="${arm_joint_effort}" velocity="${arm_joint_velocity}"/>
+      <dynamics damping="${arm_joint_damping}" friction="${arm_joint_friction}"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- 夹爪旋转关节见下方「关节实例」一节，两个指分别写清楚（不抽宏），
+       因为其中一个带 <mimic>、限位与另一个镜像，显式写最不容易出错。 -->
+
+  <!-- ==========================================================================
+       九、连杆实例
+       网格文件名与连杆名一致（对齐 akabot：mesh 按连杆命名，不按编号）
+       ========================================================================== -->
+  <xacro:arm_link name="base_plate" mesh_file="base_plate.stl" color="base_plate_color"
+                  mass="${base_plate_mass}" com="${base_plate_com}" inertia="${base_plate_inertia}"/>
+  <xacro:arm_link name="top_plate" mesh_file="top_plate.stl" color="top_plate_color"
+                  mass="${top_plate_mass}" com="${top_plate_com}" inertia="${top_plate_inertia}"/>
+  <xacro:arm_link name="lower_arm" mesh_file="lower_arm.stl" color="lower_arm_color"
+                  mass="${lower_arm_mass}" com="${lower_arm_com}" inertia="${lower_arm_inertia}"/>
+  <xacro:arm_link name="upper_arm" mesh_file="upper_arm.stl" color="upper_arm_color"
+                  mass="${upper_arm_mass}" com="${upper_arm_com}" inertia="${upper_arm_inertia}"/>
+  <xacro:arm_link name="wrist" mesh_file="wrist.stl" color="wrist_color"
+                  mass="${wrist_mass}" com="${wrist_com}" inertia="${wrist_inertia}"/>
+  <xacro:arm_link name="claw_base" mesh_file="claw_base.stl" color="claw_base_color"
+                  mass="${claw_base_mass}" com="${claw_base_com}" inertia="${claw_base_inertia}"/>
+
+  <xacro:arm_link_boxcollision name="right_claw" mesh_file="right_claw.stl" color="claw_color"
+                               mass="${right_claw_mass}" com="${right_claw_com}" inertia="${right_claw_inertia}"
+                               col_origin="${right_claw_col_origin}" col_size="${claw_col_size}"/>
+  <xacro:arm_link_boxcollision name="left_claw" mesh_file="left_claw.stl" color="claw_color"
+                               mass="${left_claw_mass}" com="${left_claw_com}" inertia="${left_claw_inertia}"
+                               col_origin="${left_claw_col_origin}" col_size="${claw_col_size}"/>
+
+  <!-- ==========================================================================
+       十、关节实例
+       ========================================================================== -->
+  <xacro:arm_revolute_joint name="top_plate_joint" parent="base_plate" child="top_plate"
+                            origin="${top_plate_xyz}" axis="${top_plate_axis}"/>
+  <xacro:arm_revolute_joint name="lower_arm_joint" parent="top_plate" child="lower_arm"
+                            origin="${lower_arm_xyz}" axis="${lower_arm_axis}"/>
+  <xacro:arm_revolute_joint name="upper_arm_joint" parent="lower_arm" child="upper_arm"
+                            origin="${upper_arm_xyz}" axis="${upper_arm_axis}"/>
+  <xacro:arm_revolute_joint name="wrist_joint" parent="upper_arm" child="wrist"
+                            origin="${wrist_xyz}" axis="${wrist_axis}"/>
+  <xacro:arm_revolute_joint name="claw_base_joint" parent="wrist" child="claw_base"
+                            origin="${claw_base_xyz}" axis="${claw_base_axis}"/>
+
+  <!-- ==========================================================================
+       夹爪方案（与参考工程 akabot / 手册批次 C 同一套「旋转对称」方案）
+
+       为什么不用 prismatic（平移）关节：
+           平移关节的运动方向一旦与重力不平行，重力就会沿运动方向产生持续阻力，
+           而 Gazebo 的位置驱动能力有限，机械臂一倾斜夹爪就推不动（会以 ABORTED
+           结束，关节纹丝不动）。
+           换成旋转关节后，重力变成「绕轴力矩」，量级小得多；两指反向运动，
+           重力矩还能互相抵消。这是参考工程实测定型下来的方案。
+
+       结构（与 akabot 的 right_claw / left_claw 一一对应）：
+           主动指 right_claw_joint   绕 Y 轴，限位 [-limit, 0]   ← 控制器只驱它
+           从动指 left_claw_joint    绕 Y 轴，限位 [0, +limit]
+                                     且 <mimic> 主动指 × (-1)
+           ⇒ 两指反向等量转动，像剪刀一样对称开合。
+
+       注意：两指限位必须镜像（一个负区间、一个正区间）。
+          写错这一处，闭合时两片指会朝同一边转。
+       注意：两指绕同一根轴（0 1 0），靠 multiplier = -1 实现镜像，
+          不要把轴线写成相反方向 —— 那样 mimic 会变成同向。
+       ========================================================================== -->
+
+  <!-- 主动指 -->
+  <joint name="right_claw_joint" type="revolute">
+    <parent link="claw_base"/>
+    <child  link="right_claw"/>
+    <origin xyz="${right_claw_xyz}" rpy="0 0 0"/>
+    <axis xyz="${right_claw_axis}"/>
+    <limit lower="-${claw_angle_limit}" upper="0.0"
+           effort="${claw_effort}" velocity="${claw_velocity}"/>
+    <dynamics damping="${arm_joint_damping}" friction="${arm_joint_friction}"/>
+  </joint>
+
+  <!-- 从动指：值 = 主动指 × (-1)，天然对称，不需要单独控制器 -->
+  <joint name="left_claw_joint" type="revolute">
+    <parent link="claw_base"/>
+    <child  link="left_claw"/>
+    <origin xyz="${left_claw_xyz}" rpy="0 0 0"/>
+    <axis xyz="${left_claw_axis}"/>
+    <limit lower="0.0" upper="${claw_angle_limit}"
+           effort="${claw_effort}" velocity="${claw_velocity}"/>
+    <dynamics damping="${arm_joint_damping}" friction="${arm_joint_friction}"/>
+    <mimic joint="right_claw_joint" multiplier="-1" offset="0"/>
+  </joint>
+
+  <!-- ==========================================================================
+       十一、TCP（工具中心点）
+
+       两指夹持面的中点，固定在 claw_base 上。规划和抓取都以它为目标点。
+
+       为什么必须有这个坐标系：`arm` 规划组的末端默认是 `claw_base`（腕回转后的
+       夹爪底座），而它离真正的抓取点有 **95.925 mm** —— 拿它当末端去"规划到某个
+       位姿"，规划的其实是它的位置，不是抓取点的位置，差得很远。
+
+       坐标系约定（零位时相对世界系）：
+           TCP +Z = 手指伸出方向
+           TCP +X = 两指开合轴
+           TCP +Y = 与两者正交（零位时朝下）
+
+       注意：下面这个 origin 是用 FK 反推出来的（两指碰撞盒心中点 → claw_base 局部系），
+          不是目测。改夹爪几何后要重算：
+              cd tools && python3 -c "from grasp_geometry import *; ..."
+       ========================================================================== -->
+  <link name="tcp"/>
+
+  <joint name="tcp_joint" type="fixed">
+    <parent link="claw_base"/>
+    <child  link="tcp"/>
+    <origin xyz="-0.000705 0.001685 -0.095925" rpy="3.141593 0 0"/>
+  </joint>
+
+</robot>

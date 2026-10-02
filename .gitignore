@@ -1,0 +1,16 @@
+# colcon 产物（每次 build 都会重新生成，不进版本库）
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 临时展开的 URDF（诊断用）
+/tmp/*.urdf

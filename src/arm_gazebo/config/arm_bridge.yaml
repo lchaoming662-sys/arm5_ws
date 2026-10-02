@@ -1,0 +1,27 @@
+# ============================================================================
+# arm_bridge.yaml — ROS 2 ←→ Gazebo 话题桥
+# ============================================================================
+# 读取者：ros_gz_bridge 的 parameter_bridge
+#         （由 arm_gazebo/launch/gz_launch.py 用 config_file 参数传入）
+#
+# 为什么需要桥：Gazebo Fortress 内部用 gz-transport 通信，ROS 2 用 DDS，
+# 两套是隔离的。只有这里显式列出的 gz 话题才会变成 ROS 2 话题。
+#
+# 注意：相机的图片话题不在这里，而是交给 ros_gz_image 的 image_bridge，
+#    因为图像转换有专门的零拷贝路径，比 parameter_bridge 高效。
+# ============================================================================
+
+# 仿真时钟：所有开了 use_sim_time 的节点都靠它走时间。
+# 少了这一条，robot_state_publisher 的 TF 时间戳会停在 0。
+- ros_topic_name: "clock"
+  gz_topic_name: "clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
+
+# 相机内参。图片本身走 image_bridge（见 gz_launch.py）。
+- ros_topic_name: "/wrist_cam/camera_info"
+  gz_topic_name: "/wrist_cam/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS

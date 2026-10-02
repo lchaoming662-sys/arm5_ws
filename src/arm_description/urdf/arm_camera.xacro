@@ -1,0 +1,170 @@
+<?xml version="1.0"?>
+<!--
+  arm_camera.xacro — 腕部相机（eye-in-hand）
+
+  ============================================================================
+  注意：尺寸说明
+  ============================================================================
+  下面用的是「虚构占位尺寸」，不对应任何真实相机型号。
+  尺寸选型尚未定案（ESP32-CAM 因 JPEG 压缩破坏角点亚像素精度、WiFi 延迟高、
+  单目无深度，已论证不适合做核心标定与闭环；最终可能改用 USB 相机或 RealSense）。
+  换相机时只改本文件的 arm_camera 宏参数
+
+  ============================================================================
+  安装设计
+  ============================================================================
+      安装面  ：claw_base 的 +Y 面（2 mm 板，零位时最高面 y = +0.0070）
+                模块「立在」腕板顶上，不是挂在侧面
+      光轴    ：在 TCP 前方约 150 mm 处与夹爪接近轴汇合，即相对水平面下倾 5.1°
+      镜头高度：在夹爪尖上方 14.3 mm（这样夹爪落在画面下部，不遮挡目标）
+
+  坐标系链：claw_base -> wrist_cam_link -> wrist_cam_optical_frame
+      光学坐标系遵循 REP-103（z 前 / x 右 / y 下），
+      image 与 camera_info 的 frame_id 用 wrist_cam_optical_frame。
+
+  ============================================================================
+  关于传感器：本文件用 Gazebo **Fortress（gz-sim 6）** 语法
+  ============================================================================
+  · Fortress 的传感器靠 gz-transport 发原始话题（默认 /wrist_cam/image、
+    /wrist_cam/camera_info），要经 ros_gz_bridge 才能变成 ROS 2 话题
+    —— 对应 arm_gazebo/config/arm_bridge.yaml 里的两条桥接。
+  · 不要在这里加 libgazebo_ros_camera.so：那是 Gazebo Classic 的写法，
+    Fortress 里找不到这个插件，会静默不发图。
+  · <gz_frame_id> 只负责给消息盖 frame_id 戳，不改变传感器朝向。
+    传感器固定沿所在 link 的 +X 看（镜头圆柱也装在 +X 侧）。
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="color_cam_body" value="0.10 0.11 0.13 1.0"/>
+  <xacro:property name="color_cam_lens" value="0.05 0.05 0.06 1.0"/>
+  <xacro:property name="cam_deg_to_rad" value="0.01745329252"/>
+
+  <material name="cam_body_color"><color rgba="${color_cam_body}"/></material>
+  <material name="cam_lens_color"><color rgba="${color_cam_lens}"/></material>
+
+  <xacro:macro name="arm_camera" params="enable_sensor:=true">
+
+    <!-- ============================================================
+         一、相机本体 link
+         由 3 个几何体拼成：底脚 + 主板 + 镜头
+         ============================================================ -->
+    <link name="wrist_cam_link">
+
+      <!-- 底脚（平贴腕板） -->
+      <visual>
+        <origin xyz="0.000000 0.000000 -0.012545" rpy="1.655340 -0.000000 -1.570796"/>
+        <geometry><box size="0.022000 0.005000 0.020000"/></geometry>
+        <material name="cam_body_color"/>
+      </visual>
+
+      <!-- 主板 -->
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.007000 0.024000 0.020000"/></geometry>
+        <material name="cam_body_color"/>
+      </visual>
+
+      <!-- 镜头 -->
+      <visual>
+        <origin xyz="0.007500 0 0" rpy="0 1.5707963 0"/>
+        <geometry><cylinder radius="0.005000" length="0.008000"/></geometry>
+        <material name="cam_lens_color"/>
+      </visual>
+
+      <!-- 碰撞体：用主板 box 近似整个模块 -->
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.007000 0.024000 0.020000"/></geometry>
+      </collision>
+
+      <!-- 质量 10 g，惯量按 7×24×20 mm 长方体估算 -->
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="0.010"/>
+        <inertia ixx="0.000000813" ixy="0" ixz="0"
+                 iyy="0.000000374" iyz="0" izz="0.000000521"/>
+      </inertial>
+    </link>
+
+    <!-- ============================================================
+         二、安装关节：claw_base -> 相机本体
+         原点 (0, 0.022, -0.027)、rpy (-π, 1.486253, -π/2)
+         这是「旋转 + 倾斜」复合变换，由几何求解得出。
+         ============================================================ -->
+    <joint name="wrist_cam_mount_joint" type="fixed">
+      <parent link="claw_base"/>
+      <child  link="wrist_cam_link"/>
+      <origin xyz="0.000000 0.022000 -0.027000" rpy="-3.141593 1.486253 -1.570796"/>
+    </joint>
+
+    <!-- ============================================================
+         三、光学坐标系（空 link）
+
+         body 系(+X 前 +Z 上) -> optical 系(+Z 前 +X 右 +Y 下)
+         标准变换：先绕 X 转 -90°，再绕 Z 转 -90°
+         ============================================================ -->
+    <link name="wrist_cam_optical_frame"/>
+
+    <joint name="wrist_cam_optical_joint" type="fixed">
+      <parent link="wrist_cam_link"/>
+      <child  link="wrist_cam_optical_frame"/>
+      <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+    </joint>
+
+    <!-- ============================================================
+         四、Gazebo Fortress 相机传感器
+
+         换相机时改这里的 fov / 分辨率 / 噪声参数
+         话题：gz 侧 /wrist_cam/image、/wrist_cam/camera_info
+
+         注意：只有**传感器**受 enable_sensor 控制，上面的 link 与关节始终存在。
+            （SRDF 里引用了 wrist_cam_link / wrist_cam_optical_frame 做碰撞
+             矩阵，link 一旦缺失 MoveIt 会报未知连杆。）
+            关掉传感器省的是渲染开销——Fortress 的 Sensors 系统在 PostUpdate
+            里等渲染线程出图，相机会拖住整个仿真循环。
+         ============================================================ -->
+    <xacro:if value="${enable_sensor}">
+    <gazebo reference="wrist_cam_link">
+      <sensor name="wrist_cam" type="camera">
+        <pose>0 0 0 0 0 0</pose>
+        <always_on>1</always_on>
+        <!--
+          注意：update_rate 与分辨率直接决定仿真能不能跑快。
+          Gazebo Fortress 的 Sensors 系统在 PostUpdate 里等渲染线程出图，
+          相机渲染一慢，整个仿真循环就被它拖住 —— 实测 640x480@30Hz
+          （软件渲染，本机只跑到 ~3 Hz）会把实时因子压到 0.14。
+          这里退到 320x240@10Hz：面积省 4 倍、频率省 3 倍。
+
+          本相机是「占位尺寸」，眼下还没有任何算法消费它的图像
+            （没有 octomap、没有检测），所以降规格不损失任何能力。
+            真要做视觉标定/检测时再按需调回去，或改用
+            `ros2 launch arm_gazebo gz_launch.py camera:=false` 整个关掉。
+        -->
+        <update_rate>10</update_rate>
+        <visualize>false</visualize>
+        <topic>wrist_cam/image</topic>
+        <gz_frame_id>wrist_cam_optical_frame</gz_frame_id>
+        <camera name="wrist_cam">
+          <horizontal_fov>${60.0 * cam_deg_to_rad}</horizontal_fov>
+          <image>
+            <width>320</width>
+            <height>240</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.02</near>
+            <far>10</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+        </camera>
+      </sensor>
+    </gazebo>
+    </xacro:if>
+
+  </xacro:macro>
+
+</robot>

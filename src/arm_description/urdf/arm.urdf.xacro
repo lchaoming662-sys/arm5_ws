@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<!--
+  arm.urdf.xacro — 显示用总装
+
+  只做装配，供 RViz 查看（robot_state_publisher / joint_state_publisher_gui）。
+  不含任何 Gazebo 或 ros2_control 内容。
+
+  展开： xacro arm.urdf.xacro > /tmp/arm.urdf
+-->
+<robot name="o5_2_arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- use_camera:=false 只关掉 Gazebo 传感器，相机的 link/关节仍在模型里
+       （SRDF 的碰撞矩阵引用了它们，不能缺） -->
+  <xacro:arg name="use_camera" default="true"/>
+
+  <!-- 纯模型：连杆 + 关节 -->
+  <xacro:include filename="$(find arm_description)/urdf/arm_core.xacro"/>
+
+  <!-- 腕部相机 -->
+  <xacro:include filename="$(find arm_description)/urdf/arm_camera.xacro"/>
+  <xacro:arm_camera enable_sensor="$(arg use_camera)"/>
+
+</robot>

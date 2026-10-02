@@ -1,0 +1,44 @@
+# ============================================================================
+# moveit_controllers.yaml — MoveIt 执行轨迹时找哪些控制器
+# ============================================================================
+# MoveIt 只负责"算出轨迹"，真正驱动关节的是 controller_manager 里的控制器。
+# 这份文件把 SRDF 的规划组映射到【已经在跑的】action：
+#
+#   arm       → /arm_controller/follow_joint_trajectory   (JointTrajectoryController)
+#   gripper   → /gripper_controller/gripper_cmd           (GripperActionController，单关节)
+#
+# 注意：action_ns 只写 action 名，不带前导斜杠；控制器名要与
+#    arm_bringup/config/arm_controllers.yaml 里声明的一致，否则执行时报
+#    "Unable to identify any set of controllers"。
+# ============================================================================
+
+trajectory_execution:
+  allowed_execution_duration_scaling: 2.0    # 仿真比真实时间慢，放宽时长容忍
+  allowed_goal_duration_margin: 1.0
+  allowed_start_tolerance: 0.05             # 起点的关节容差（rad），别给 0
+  trajectory_duration_monitoring: false     # 仿真 RTF 波动大，关掉时长监控
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - arm_controller
+    - gripper_controller
+
+  arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - top_plate_joint
+      - lower_arm_joint
+      - upper_arm_joint
+      - wrist_joint
+      - claw_base_joint
+
+  gripper_controller:
+    type: GripperCommand
+    action_ns: gripper_cmd
+    default: true
+    joints:
+      - right_claw_joint

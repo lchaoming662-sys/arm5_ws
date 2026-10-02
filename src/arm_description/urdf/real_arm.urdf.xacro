@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<!--
+  real_arm.urdf.xacro — 真机总装（对齐 akabot 的 real_akabot.urdf.xacro）
+
+  ============================================================================
+  和 arm_gz.urdf.xacro 的关系
+  ============================================================================
+      arm.urdf.xacro        纯显示：模型 + 相机
+      arm_gz.urdf.xacro     仿真：模型 + 相机 + ros2_control(仿真插件) + Gazebo 物理
+      real_arm.urdf.xacro   真机：模型 + 相机 + ros2_control(真机插件)      ← 本文件
+
+  三者的差别**只在「谁来提供 ros2_control 的硬件接口」**：
+  接口声明本身是同一份（arm.ros2_control.xacro），插件名由调用方传入。
+
+  ============================================================================
+  用法
+  ============================================================================
+      # 1) 直接展开看看（插件留空，结构仍是合法 URDF）
+      xacro real_arm.urdf.xacro > /tmp/real_arm.urdf && check_urdf /tmp/real_arm.urdf
+
+      # 2) 指定真机硬件插件
+      xacro real_arm.urdf.xacro hardware_plugin:=my_arm_hardware/MyArmSystem
+
+      # 3) 在自己包的 launch 里传进来
+      Command(['xacro ', real_arm_urdf, ' hardware_plugin:=', my_plugin])
+
+  注意：hardware_plugin 留空时展开出的 <plugin></plugin> 只是占位：
+     真起 ros2_control_node 会因为找不到空插件名而报错。这是**故意的** ——
+     本工程还没有真机硬件接口，留空比编一个假插件名诚实。
+
+  ============================================================================
+  注意：本工程的真机路线尚未打通
+  ============================================================================
+  原始设计的真机链路走的是自建的 `arm_teleop_executor`（自己发舵机指令），
+  **不经过 ros2_control**。所以这个文件目前是「结构就绪、插件待接」的状态：
+  它让 arm_description 的接口声明在真机侧也有一个正规入口，
+  但真正接舵机时要么写一个 hardware_interface 组件，要么继续用原方案。
+  详见 docs/使用说明书.md 第九节。
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="o5_2_arm">
+
+  <!-- 硬件插件名。留空 = 占位；真机接好后从命令行传 -->
+  <xacro:arg name="hardware_plugin" default=""/>
+
+  <!-- 模型 + 相机（与仿真共用同一份模型，保证仿真/真机几何一致） -->
+  <xacro:include filename="$(find arm_description)/urdf/arm.urdf.xacro"/>
+
+  <!-- ros2_control 接口声明（只是声明，不含硬件实现） -->
+  <xacro:include filename="$(find arm_description)/urdf/arm.ros2_control.xacro"/>
+
+  <!-- 实例化接口，插件名由外部传入 -->
+  <xacro:arm_ros2_control name="RealSystem" plugin_name="$(arg hardware_plugin)"/>
+
+</robot>

@@ -1,0 +1,25 @@
+# ============================================================================
+# initial_positions.yaml — ros2_control 各关节的初始状态值
+# ============================================================================
+# 被 arm.ros2_control.xacro 通过 xacro.load_yaml 读进来，填进每个
+# <state_interface name="position"> 的 <param name="initial_value">。
+#
+# 单位：全部是 rad（夹爪也已改成旋转副，不再是米）。
+#
+# 为什么需要它：不给的话初始姿态取决于 Gazebo 的默认行为，
+# 「启动姿势」就变成不确定的。给 0 表示「全部回到机械零位」——
+# 对夹爪而言 0.0 就是竖直张开位。
+#
+# 注意：每个值都必须落在 arm_core.xacro 里对应的 <limit> 区间内，
+#    否则 gz_ros2_control 会在启动时报越界。
+#    注意夹爪两个限位是镜像的：jaw_a ∈ [-0.90, 0]，jaw_b ∈ [0, +0.90]。
+# ============================================================================
+
+initial_positions:
+  top_plate_joint: 0.0
+  lower_arm_joint: 0.0
+  upper_arm_joint: 0.0
+  wrist_joint: 0.0
+  claw_base_joint: 0.0
+  right_claw_joint: 0.0
+  left_claw_joint: 0.0

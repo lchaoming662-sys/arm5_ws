@@ -1,0 +1,114 @@
+<?xml version="1.0"?>
+<!--
+  arm.ros2_control.xacro — ros2_control 硬件接口声明
+
+  ============================================================================
+  这个文件只声明「有哪些接口」，不声明「谁来提供」
+  ============================================================================
+  硬件插件名由调用方传入（params="name plugin_name"），于是同一份接口声明
+  可以同时服务：
+      · 仿真：gz_ros2_control/GazeboSimSystem  （由 arm_gz.urdf.xacro 传）
+      · 真机：自己写的 hardware_interface 组件  （将来由真机总装文件传）
+
+  ============================================================================
+  接口设计
+  ============================================================================
+      command : 一律只有 position —— 位置直通，不走 PID
+      state   : position + velocity
+
+      为什么这里可以放心声明 velocity（而 Gazebo Classic 版不敢）：
+          Fortress 的 gz_ros2_control 会真从物理引擎读关节速度，
+          给出的是有限值；不需要 URDF 里的 <gains> 也正常工作。
+          Gazebo Classic 的 gazebo_ros2_control 才有「无 <gains> 时
+          速度可能为 NaN」的顾虑，那套顾虑在 Fortress 上不适用。
+
+      夹爪是「主动指 + mimic 从动指」：
+          right_claw_joint 由控制器直接驱动；
+          left_claw_joint 声明 mimic（值 = 主动指 × -1），
+          两指因此天然对称开合，不需要第二个控制器，也不存在同步误差。
+          注意：mimic 是「关节层」的联动，与移动副/旋转副无关 —— 这里两指都是
+             revolute，改自模型的平移方案，理由见 arm_core.xacro 的「夹爪方案」。
+  ============================================================================
+  初始状态值来自 config/initial_positions.yaml（akabot 的同一套做法），
+  这样启动姿态是确定的，不依赖 Gazebo 的默认值。
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="initial_positions_file"
+                  value="$(find arm_description)/config/initial_positions.yaml"/>
+  <xacro:property name="initial_positions"
+                  value="${xacro.load_yaml(initial_positions_file)['initial_positions']}"/>
+
+  <xacro:macro name="arm_ros2_control" params="name plugin_name">
+
+    <ros2_control name="${name}" type="system">
+
+      <hardware>
+        <plugin>${plugin_name}</plugin>
+      </hardware>
+
+      <!-- ================ 5 个臂关节 ================ -->
+      <joint name="top_plate_joint">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['top_plate_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <joint name="lower_arm_joint">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['lower_arm_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <joint name="upper_arm_joint">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['upper_arm_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <joint name="wrist_joint">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['wrist_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <joint name="claw_base_joint">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['claw_base_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <!-- ================ 2 个夹爪关节（旋转） ================ -->
+      <joint name="right_claw_joint">
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['right_claw_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <!-- 从动指：mimic 主动指，倍数 -1（反向等量 → 对称开合） -->
+      <joint name="left_claw_joint">
+        <param name="mimic">right_claw_joint</param>
+        <param name="multiplier">-1</param>
+        <command_interface name="position"/>
+        <state_interface name="position">
+          <param name="initial_value">${initial_positions['left_claw_joint']}</param>
+        </state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+
+    </ros2_control>
+  </xacro:macro>
+
+</robot>

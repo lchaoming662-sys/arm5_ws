@@ -1,0 +1,24 @@
+# ============================================================================
+# pilz_cartesian_limits.yaml — Pilz 工业运动规划器的笛卡尔限位
+# ============================================================================
+# 本工程规划用 OMPL，不用 Pilz。但这份文件【必须存在】且有值：
+#
+#   1) MoveItConfigsBuilder.to_moveit_configs() 默认会读它，
+#      【文件不存在直接抛异常】，整个 launch 起不来：
+#          [ERROR] [launch]: Caught exception in launch:
+#            "File .../config/pilz_cartesian_limits.yaml doesn't exist"
+#
+#   2) 留空字典虽然能起来，但 move_group 会刷 4 条 ERROR：
+#          Parameter 'robot_description_planning.cartesian_limits.max_trans_vel',
+#          is not set in the config file.
+#          （max_trans_acc / max_trans_dec / max_rot_vel 同理）
+#      所以按 Pilz 官方默认值填上。
+#
+# 将来真要用 Pilz 的 LIN / PTP / CIRC，这些值才真正参与约束。
+# ============================================================================
+
+cartesian_limits:
+  max_trans_vel: 1.0      # m/s
+  max_trans_acc: 2.25     # m/s²
+  max_trans_dec: -5.0     # m/s²
+  max_rot_vel: 1.57       # rad/s

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arm_gazebo</name>
+  <version>0.1.0</version>
+  <description>O5-2 机械臂的 Gazebo Fortress 仿真环境（世界 / 桥接 / 启动）</description>
+  <maintainer email="lchaoming662@gmail.com">黎超明</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 仿真硬件接口插件（提供 controller_manager）。
+       注：本机只装了 gz_ros2_control，没有 ign_ros2_control 这个包，
+       因此这里只声明前者。gz_ros2_control 内部已保留
+       ign_ros2_control/IgnitionSystem 的向后兼容别名。 -->
+  <depend>gz_ros2_control</depend>
+  <depend>ros_gz_sim</depend>
+  <depend>ros_gz_bridge</depend>
+  <depend>ros_gz_image</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
