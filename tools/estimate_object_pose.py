@@ -202,6 +202,15 @@ def main():
                          '依据是这条臂只能抓地面上的物体；设 -1 关闭')
     ap.add_argument('--model', default=None,
                     help='顺便读该 Gazebo 模型的真值做对照，如 target_cube')
+    ap.add_argument('--expect-size', type=float, default=0.025,
+                    help='预期工件宽度（米），用于有效性检查。设 0 关闭检查。'
+                         '默认 25 mm —— 本工程的目标是 25 mm 立方体')
+    ap.add_argument('--min-span-ratio', type=float, default=0.80,
+                    help='实测跨度不得小于 工件尺寸×该比例（默认 0.80）')
+    ap.add_argument('--max-span-ratio', type=float, default=1.80,
+                    help='实测跨度不得大于 工件尺寸×该比例（默认 1.80）')
+    ap.add_argument('--min-points-total', type=int, default=400,
+                    help='点簇点数下限，低于此值判为没看全（默认 400）')
     ap.add_argument('--json', action='store_true',
                     help='只输出一行 JSON（给抓取流水线消费），'
                          '人类可读的过程输出全部丢弃')
@@ -319,14 +328,77 @@ def main():
 
     obj = clusters[0]
     lo, hi = obj.min(axis=0), obj.max(axis=0)
-    center = (lo + hi) / 2.0
-    size = hi - lo
+    bbox_c = (lo + hi) / 2.0
+
+    # 中心估计用 1/99 分位的区间中点，而不是包围盒中心。
+    #
+    # 实测（臂在 grasp_ready、方块在工作位，8 帧）：
+    #     估计量      x 均值   x 最差    y 均值   y 最差
+    #     bbox       -1.18    1.86     +0.45    0.57     ← 原来用的
+    #     centroid   -0.41    0.43     +3.27    3.33     ← y 上被第二瓣拽走
+    #     p1p99      -0.87    1.06     +0.81    0.98     ← 最差值最小
+    #     p2p98      -0.58    0.67     +1.08    1.28
+    # bbox 的问题是 min/max 对稀疏尾点太敏感：顶面远边那几个点每箱只有个位数，
+    # 却能把边界拉出去好几毫米。质心更糟 —— 视野里除了顶面还有一片"第二瓣"
+    # （掠射角下地面残留），y 方向被它拽偏 3 mm 以上。
+    # 1/99 分位把两端的稀疏尾点修掉，最差误差从 1.86 降到 1.06 mm。
+    x_lo, x_hi = np.percentile(obj[:, 0], 1.0), np.percentile(obj[:, 0], 99.0)
+    y_lo, y_hi = np.percentile(obj[:, 1], 1.0), np.percentile(obj[:, 1], 99.0)
+    center = np.array([0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi)])
+    size = np.array([x_hi - x_lo, y_hi - y_lo, hi[2] - lo[2]])
 
     print(f'\n=== 目标位姿（{args.frame} 系）===')
     print(f'  点数    {len(obj)}')
-    print(f'  中心 xy x {center[0]:+.4f}   y {center[1]:+.4f}')
+    print(f'  中心 xy x {center[0]:+.4f}   y {center[1]:+.4f}'
+          f'   （1-99 分位区间中点，非包围盒中心）')
     print(f'  观测范围 dx {size[0]:.4f}  dy {size[1]:.4f}  dz {size[2]:.4f}')
     print(f'  z 区间   [{lo[2]:+.4f}, {hi[2]:+.4f}]')
+    print(f'  包围盒   x [{lo[0]:+.4f}, {hi[0]:+.4f}]  y [{lo[1]:+.4f}, {hi[1]:+.4f}]'
+          f'   （对比用）')
+
+    # ---------------------------------------------------------------------
+    # 有效性检查：不合格就直接退出，不要输出一个「看起来正常」的错误位姿。
+    #
+    # 为什么必须查：物体偏离相机视野中心时，视野里只剩它的一部分，算法就在
+    # 这块**碎片**上算中心，误差会一路恶化到 10 mm。实测（臂在扫描位形）：
+    #
+    #     方块位置              点簇点数   x 跨度    中心 x 误差
+    #     (0.0150, 0.0400)      2444     29.5 mm   +0.50 mm    ← 好
+    #     (0.0267, 0.0245)      2466     26.7 mm   -1.18 mm    ← 工作位
+    #     (0.0450, 0.0245)      1216     16.8 mm   +3.75 mm    ← 边缘
+    #     (0.0380, 0.0080)       328      9.7 mm   +9.72 mm    ← 严重截断
+    #
+    # 而下游（流水线）会把结果直接当位姿用，10 mm 的错位会让机械臂扑空、
+    # 或者更糟 —— 夹到空气却报「执行完成」。这类「安静地给错答案」比直接失败
+    # 危险得多，所以宁可拒绝，也不输出把握不足的结果。
+    #
+    # 判据用**跨度**而不是点数：点数在 1216 与 2466 之间都可能是错的，
+    # 分不开；而跨度是「看到了物体多宽」的直接度量，截断必然体现为跨度变小。
+    # ---------------------------------------------------------------------
+    if args.expect_size > 0:
+        span = (float(x_hi - x_lo), float(y_hi - y_lo))
+        lo_lim = args.expect_size * args.min_span_ratio
+        hi_lim = args.expect_size * args.max_span_ratio
+        bad = [n for n, s in zip(('x', 'y'), span) if not lo_lim <= s <= hi_lim]
+        print(f'\n=== 有效性检查（预期工件 {args.expect_size*1000:.0f} mm，'
+              f'允许跨度 {lo_lim*1000:.0f}~{hi_lim*1000:.0f} mm）===')
+        print(f'  实测跨度 x {span[0]*1000:.1f} mm   y {span[1]*1000:.1f} mm')
+        if bad:
+            print(f'  ✗ {"/".join(bad)} 方向跨度不在允许范围内 —— '
+                  f'目标可能只有一部分在视野里，算出来的中心是「碎片中心」。',
+                  file=sys.stderr)
+            print(f'    解决办法：把目标移到相机视野中心附近，或调整扫描位形'
+                  f'（SCAN_POSE）。不要在结果可疑时继续用。', file=sys.stderr)
+            node.destroy_node()
+            rclpy.shutdown()
+            return finish(8)
+        if len(obj) < args.min_points_total:
+            print(f'  ✗ 点数 {len(obj)} 少于下限 {args.min_points_total} —— '
+                  f'目标多半没被完整看到。', file=sys.stderr)
+            node.destroy_node()
+            rclpy.shutdown()
+            return finish(8)
+        print('  ✓ 通过')
 
     # 相机几乎垂直向下（实测光轴与竖直只差 8.5 度），25 mm 高的侧面在图像里
     # 只摊开 25*sin(12.3) ≈ 5 mm —— 于是点云实际只覆盖了目标顶面，中心高度
@@ -359,7 +431,10 @@ def main():
         print(f'  贴地反推的中心 z = {center_z:+.4f}'
               '（相机几乎垂直向下，测不到中心高度）')
 
+    truth = None
     if args.model:
+        # 只调一次：ign 是子进程调用，第二次可能因为仿真瞬时忙而返回 None，
+        # 于是 payload 里会出现 truth 有值、gazebo_truth 是 null 的怪组合。
         truth = gazebo_truth(args.model)
         print(f'\n=== 与 Gazebo 真值对照（{args.model}）===')
         if truth is None:
@@ -401,7 +476,7 @@ def main():
         'frame': args.frame,
     }
     if args.model:
-        payload['gazebo_truth'] = gazebo_truth(args.model)
+        payload['gazebo_truth'] = truth
 
     node.destroy_node()
     rclpy.shutdown()
