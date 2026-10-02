@@ -44,6 +44,14 @@
   <!-- ======================== 预设姿态 ========================
        grasp_ready 的数值来自 tools/solve_grasp_poses.py 解出的「预抓取位形」，
        和 tools/pick_demo.py 里的 PREGRASP 是同一组，方便规划→抓取衔接。
+
+       例外：wrist_joint 这里是 -1.45，比 PREGRASP 的 -1.55 收了一点。
+       原因：joint_limits.yaml 给腕关节加了位置余量（±1.5708 → ±1.50），
+       -1.55 已经落在规划边界之外，拿它当起始状态会报
+       "Starting state is just outside bounds (joint 'wrist_joint')"。
+       另外 -1.55 离硬限位本来就只有 0.021 rad，本身就是上面那个余量要治的
+       毛病，所以这里跟着收，而不是把余量放宽。PREGRASP 那份要一起改的话
+       得重跑 tools/pick_demo.py 验证，见 docs/使用说明书.md 第九节。
        ======================================================== -->
 
   <group_state name="home" group="arm">
@@ -58,7 +66,7 @@
     <joint name="top_plate_joint" value="0"/>
     <joint name="lower_arm_joint" value="-0.0385"/>
     <joint name="upper_arm_joint" value="-0.1531"/>
-    <joint name="wrist_joint" value="-1.55"/>
+    <joint name="wrist_joint" value="-1.45"/>
     <joint name="claw_base_joint" value="0"/>
   </group_state>
 

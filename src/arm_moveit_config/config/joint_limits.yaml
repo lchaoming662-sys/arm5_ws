@@ -42,16 +42,58 @@ joint_limits:
     max_velocity: 2.0
     has_acceleration_limits: true
     max_acceleration: 3.0
+  # ---------------------------------------------------------------------------
+  # wrist_joint / claw_base_joint：位置限位各收 0.0708 rad（±1.5708 → ±1.50）
+  # ---------------------------------------------------------------------------
+  # 只收这两个，不收另外三个臂关节。为什么：
+  #   URDF 里五个臂关节共用 ±1.5708 的位置限位，而 MoveIt 这条链路走
+  #   position_only_ik（5 自由度只能约束位置），KDL 解出来的位形会把**腕部
+  #   这两个关节**一路顶到限位上停住；top_plate / lower_arm / upper_arm
+  #   在实测里离限位都很远（最小 -0.25 ~ -0.39），没有必要动。
+  #
+  #   实测（干净单仿真跑完整抓取演示，采样 /arm_controller/state 与 /joint_states）：
+  #       wrist_joint      实际最小 -1.57080（正好是硬限位的值）
+  #                        跟踪误差峰值 0.07705
+  #       claw_base_joint  实际最小 -1.57080
+  #                        跟踪误差峰值 0.08000
+  #   而 arm_controllers.yaml 给的 trajectory 容差是 0.12 ——
+  #   claw_base 的余量只剩 1.50 倍，是全臂最紧的。
+  #
+  #   关节顶在硬止点上时，位置约束和伺服在抢同一个自由度，跟踪误差就是
+  #   在这个位形上最大。之前那次 CONTROL_FAILED(-4) 正是腕关节误差冲到
+  #   0.121 越过容差被掐断。
+  #   （关节"停在限位上"和"关节坏了"是两件事：从零位走到 -1.5708 再回来
+  #     是成功的，详见 docs/踩坑记录.md 第 31 条。）
+  #
+  # 为什么是 0.0708、不再往大里收：
+  #   tools/solve_grasp_poses.py 解出的设计抓取位形用的是 wrist = -1.466。
+  #   收得比它更紧（例如 ±1.45）会让这个设计位形直接不可达。
+  #   0.0708 既让关节离开硬止点，又给设计位形留 0.034 rad 余量。
+  #   claw_base 没有这个问题：设计位形里它取 0，收紧不影响任何设计值。
+  #
+  # 这层余量的作用边界（别误读）：
+  #   它只改**规划模型**的变量边界，让规划器与 IK 不再产生落在硬止点上的目标。
+  #   它不改 URDF 的物理限位，也不代表机械上真有这么大余量。
+  #   如果要更彻底，应该重解抓取位形、让腕角压根不靠近限位；
+  #   现在 tools/pick_demo.py 的 PREGRASP / LIFT 还写着 wrist = -1.55
+  #   （离硬限位只有 0.021 rad），那是改 tools/ 的事，不在这份配置里。
+  # ---------------------------------------------------------------------------
   wrist_joint:
     has_velocity_limits: true
     max_velocity: 2.0
     has_acceleration_limits: true
     max_acceleration: 3.0
+    has_position_limits: true
+    min_position: -1.50
+    max_position: 1.50
   claw_base_joint:
     has_velocity_limits: true
     max_velocity: 2.0
     has_acceleration_limits: true
     max_acceleration: 3.0
+    has_position_limits: true
+    min_position: -1.50
+    max_position: 1.50
 
   # 夹爪限位区间只有 0.9 rad，速度给大了容易冲过方块。保持保守。
   right_claw_joint:
