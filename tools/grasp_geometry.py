@@ -1,7 +1,16 @@
 """arm5 抓取几何工具：FK / 夹爪位姿 / 简易 IK
 
-展开后的 URDF 需要一份。优先用工作区里的，找不到就现场从 xacro 展开一次。
-（改过 arm_core.xacro 后请重跑本模块，避免用旧模型算出来的位形。）
+模型来源：本工程的 arm_gz.urdf.xacro，每次导入时现场展开一次。
+
+为什么不用 /tmp 里的展开产物做缓存：
+  以前是「优先读 /tmp/arm_gz.urdf，读不到才现场展开」，而展开失败时会静默
+  留在旧文件上。后来模型关节改名（joint1..joint5 → 语义名），旧的 /tmp 文件
+  没人清，这里就一直在拿它当当前模型：关节名对不上，q.get() 一律取到默认值 0，
+  于是所有关节角都退化成零位。症状是「不同位形算出完全相同的位姿」，
+  而且不报任何错，属于「安静地给错答案」，比直接崩掉危险得多。
+  现在宁可每次多花一秒展开，也不留这种缓存。
+
+  另外加了关节名自检：展开出来的模型不是这台臂就当场报错。
 """
 import math
 import os
@@ -9,23 +18,39 @@ import subprocess
 import xml.etree.ElementTree as ET
 
 _WS = os.path.expanduser('~/arm5_ws')
-_XACRO = os.path.join(_WS, 'install/arm_description/share/arm_description/urdf/arm_gz.urdf.xacro')
+_XACRO = os.path.join(_WS, 'src/arm_description/urdf/arm_gz.urdf.xacro')
+
+# 本工程模型的关节名，用来证明展开出来的是同一台机器人
+_EXPECTED_JOINTS = {
+    'top_plate_joint', 'lower_arm_joint', 'upper_arm_joint',
+    'wrist_joint', 'claw_base_joint', 'right_claw_joint', 'left_claw_joint',
+}
 
 
-def _find_urdf():
-    for p in ('/tmp/arm_gz.urdf',
-              os.path.join(_WS, 'install/arm_description/share/arm_description/urdf/arm_gz.urdf.urdf')):
-        if os.path.isfile(p):
-            return p
-    subprocess.run(['bash', '-lc',
-                    'source /opt/ros/humble/setup.bash && '
-                    f'source {_WS}/install/setup.bash && '
-                    f'xacro {_XACRO} > /tmp/arm_gz.urdf'],
-                   capture_output=True, text=True)
-    return '/tmp/arm_gz.urdf'
+def _expand_urdf():
+    """现场展开 xacro。失败就抛异常，绝不回退到任何缓存文件。"""
+    script = ('set +u; source /opt/ros/humble/setup.bash; '
+              f'source {_WS}/install/setup.bash; '
+              f'xacro {_XACRO} use_camera:=true')
+    r = subprocess.run(['bash', '-lc', script], capture_output=True, text=True)
+    if r.returncode != 0 or '<robot' not in r.stdout:
+        raise RuntimeError(
+            '展开 arm_gz.urdf.xacro 失败，几何计算无法进行。\n'
+            f'命令：{script}\n'
+            f'stderr：{r.stderr.strip()[:2000]}')
+    return r.stdout
 
 
-URDF = _find_urdf()
+URDF = _XACRO          # 模型来源，仅供打印与报错时指认
+_root = ET.fromstring(_expand_urdf())
+
+_got_joints = {j.get('name') for j in _root.findall('joint')}
+_missing = _EXPECTED_JOINTS - _got_joints
+if _missing:
+    raise RuntimeError(
+        f'展开出的模型缺少本工程的关节 {sorted(_missing)}，'
+        f'实际拿到 {sorted(_got_joints)}。\n'
+        '检查 _XACRO 是否指向了别的模型，或 arm_core.xacro 是否被改过关节名。')
 
 BOX = {  # 夹爪碰撞盒：相对各自 jaw link 的 origin 与尺寸
     'right_claw': ([-0.015500, -0.004500, -0.013500], [0.012, 0.012, 0.037]),
@@ -83,7 +108,6 @@ def cross(a, b):
     return [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
 
 
-_root = ET.parse(URDF).getroot()
 _kids = {}
 for _j in _root.findall('joint'):
     _kids.setdefault(_j.find('parent').get('link'), []).append(_j)
