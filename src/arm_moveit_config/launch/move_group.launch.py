@@ -31,6 +31,31 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration("use_sim_time")
 
+    # capabilities 必须显式列全：这个参数一旦设置就会【替换】move_group 的
+    # 默认列表，而不是追加。不设的时候实测只加载了 5 个（ApplyPlanningScene /
+    # ExecuteTrajectory / GetPlanningScene / MotionPlan / QueryPlanners），
+    # 连 MoveGroupMoveAction 都没有。
+    #
+    # 末尾的 ExecuteTaskSolutionCapability 是 MTC 执行所必需的：
+    # MTC 的 Task.execute() 文档写的是「Send given solution to move_group node
+    # for execution」，它走的就是这个 capability 提供的 action。
+    # 缺了它，MTC 规划能成功、执行却直接返回 FAILURE(99999)，
+    # 而且 move_group 侧几乎不打印任何东西 —— 很难从现象反推原因。
+    capabilities = " ".join([
+        "move_group/ApplyPlanningSceneService",
+        "move_group/ClearOctomapService",
+        "move_group/MoveGroupCartesianPathService",
+        "move_group/MoveGroupExecuteTrajectoryAction",
+        "move_group/MoveGroupGetPlanningSceneService",
+        "move_group/MoveGroupKinematicsService",
+        "move_group/MoveGroupMoveAction",
+        "move_group/MoveGroupPickPlaceAction",
+        "move_group/MoveGroupPlanService",
+        "move_group/MoveGroupQueryPlannersService",
+        "move_group/MoveGroupStateValidationService",
+        "move_group/ExecuteTaskSolutionCapability",
+    ])
+
     return LaunchDescription([
         DeclareLaunchArgument(
             "use_sim_time", default_value="true",
@@ -43,6 +68,7 @@ def generate_launch_description():
             parameters=[
                 moveit_config.to_dict(),
                 {"use_sim_time": use_sim_time},
+                {"capabilities": capabilities},
             ],
         ),
     ])

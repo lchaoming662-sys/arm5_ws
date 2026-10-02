@@ -39,6 +39,7 @@
 
   <group name="gripper">
     <joint name="right_claw_joint"/>
+    <joint name="left_claw_joint"/>
   </group>
 
   <!-- ======================== 预设姿态 ========================
@@ -74,9 +75,35 @@
     <joint name="right_claw_joint" value="0"/>
   </group_state>
 
+  <!-- 闭合角 -0.15 是按几何算的，不是手调的。
+       tools/pick_demo_moveit.py 算出的「夹持面间距 ~ 主动指转角」表：
+           0.00     29.28 mm（还没碰到 25 mm 的方块）
+          -0.1465   25.00 mm（刚好贴住）
+          -0.20     23.29 mm（多压 1.71 mm）
+       原来写 -0.35 时实测会把方块挤走 11 mm（见 docs/踩坑记录.md 第 27 条）。
+       这里取 -0.15：压入量约 0.14 mm，接触刚度 1e6 N/m 下夹持力绰绰有余。
+       之所以不能用 -0.20：夹爪用的是 JointTrajectoryController（见
+       arm_bringup/config/arm_controllers.yaml 的说明），到不了目标位置就会报
+       GOAL_TOLERANCE_VIOLATED，而"手指压住方块停住"正是到不了。
+       从 GripperActionController 换成 JTC 之后，这一项必须跟着改。 -->
   <group_state name="close" group="gripper">
-    <joint name="right_claw_joint" value="-0.20"/>
+    <joint name="right_claw_joint" value="-0.15"/>
   </group_state>
+
+  <!-- ======================== 末端执行器 ========================
+       MTC（MoveIt Task Constructor）的 Pick / Place 阶段要求 SRDF 里显式
+       声明末端执行器，否则 setEndEffector("gripper") 找不到对应定义。
+
+       parent_link 取 tcp 而不是 claw_base：
+         gripper 组的指关节物理上挂在 claw_base 上，但 tcp 才是两指夹持面
+         中点，也就是真正的抓取点。MTC 生成抓取候选时把位姿设在末端执行器
+         的 parent_link 上，若写 claw_base，每个候选都会整体偏 95.925 mm
+         （见 arm_core.xacro 第十一节）。
+
+       parent_group 指向 arm，表示这个末端由 arm 组送到目标位姿。
+       ======================================================== -->
+
+  <end_effector name="gripper" parent_link="tcp" group="gripper" parent_group="arm"/>
 
   <!-- ======================== 碰撞矩阵 ======================== -->
 
