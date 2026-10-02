@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""grasp_pipeline_mtc.py — O5-2 的抓取流水线（MoveIt Task Constructor）
+"""grasp_pipeline_mtc.py — O5-2 的抓放流水线（MoveIt Task Constructor）
 
-把「生成抓取候选 → IK 过滤 → 接近 → 夹取 → 抬起」串成一条流水线。
-这是 ROS 2 生态里 moveit_grasps 的对应物：moveit_grasps 只有 ROS 1 版本
-（仓库无 ros2 分支，apt 三个发行版都没有），MTC 才是官方在 ROS 2 上的那条路。
+把「生成抓取候选 → IK 过滤 → 接近 → 夹取 → 抬起 → 下压 → 张开 → 摘手 → 撤离」
+串成一条流水线。这是 ROS 2 生态里 moveit_grasps 的对应物：moveit_grasps 只有
+ROS 1 版本（仓库无 ros2 分支，apt 三个发行版都没有），MTC 才是官方在 ROS 2
+上的那条路。
 
 阶段链：
     CurrentState          取当前位形作为起点
@@ -11,6 +12,7 @@
     GenerateGraspPose     绕物体批量生成候选抓取位姿（angle_delta 控制疏密）
     SimpleGrasp           对每个候选做 IK，并编排夹爪开合
     Pick                  接近 / 夹取 / 抬起
+    Place                 下压 / 放置位姿 IK / 张开 / 摘手 / 撤离
 
 前置：仿真在跑、move_group 在跑。省事的一条命令：
     ros2 launch arm_bringup bringup.launch.py
@@ -19,6 +21,7 @@
     ros2 launch arm_bringup grasp_mtc.launch.py
     ros2 launch arm_bringup grasp_mtc.launch.py display:=true
     ros2 launch arm_bringup grasp_mtc.launch.py execute:=true
+    ros2 launch arm_bringup grasp_mtc.launch.py place:=false   只抓不起放（调试用）
 
 为什么必须走 launch、不能直接 python 跑：
     MTC 要的是整套 MoveIt 参数 —— robot_description / robot_description_semantic
@@ -60,7 +63,20 @@ ARM_JOINTS = ('top_plate_joint', 'lower_arm_joint', 'upper_arm_joint',
 GRIPPER_JOINT = 'right_claw_joint'
 ARM_ACTION = '/arm_controller/follow_joint_trajectory'
 GRIPPER_ACTION = '/gripper_controller/follow_joint_trajectory'
+GRIPPER_GROUP = 'gripper'      # SRDF 里的夹爪组，MoveTo 开合都用它
 OBJECT_XYZ = (0.0267, 0.0245, 0.0125)   # 世界文件里的真值（贴地 25 mm 立方体）
+
+# 放回目标：**方块中心**在 base_link 下的目标 XY。
+# 默认与 OBJECT_XYZ 相同，也就是「原位放回」。这不是偷懒 —— 旧演示
+# tools/pick_demo_moveit.py 第 8 步也是原位放回（沿 Z 压回台面），保持一致
+# 才能拿两边的抬起量/落点直接对比。
+# 高度不在这里给：方块中心的高度恒为「贴台面」= OBJECT_XYZ[2]，
+# 由 GRASP_TCP_Z 换算成 tcp 高度（见放回那一段）。
+PLACE_XYZ = OBJECT_XYZ
+
+# 抬起与下压共用一个距离。绑成一对：下压要正好把方块送回台面，
+# 压过头会撞台面（伺服顶住不动，JTC 报 GOAL_TOLERANCE_VIOLATED）。
+LIFT_DISTANCE = 0.050
 
 # 速度缩放。关节段 0.40、笛卡尔段 0.25，两档都取自 tools/pick_demo_moveit.py
 # 里已经实测标定过的那一组常数（那里记着实测依据）：
@@ -74,15 +90,27 @@ CART_VEL_SCALE = 0.25
 CART_ACC_SCALE = 0.25
 CART_MAX_STEP = 0.004      # 笛卡尔路径步长 4 mm
 
-# 抓取点相对【物体中心】的高度偏移。
-# GenerateGraspPose 生成的位姿原点在物体中心，而抓取点必须更高：指盒沿指长
-# 有 ±18.5 mm，放到方块中心会让指尖戳进台面 5.4 mm。
-# 数值取自 tools/pick_demo_moveit.py 已标定的 GRASP_TCP_Z：
-#     抓取位 TCP 高度 = 台面 + 指尖间隙 + 指盒半长 = 0.0046 + 0.0185 = 0.0231 m
-# 方块中心离台面 0.0125 m，所以偏移 = 0.0231 - 0.0125 = 0.0106 m。
+# 抓取/放置位姿下的 tcp 高度（相对台面），以及它相对【物体中心】的偏移。
+# 物理含义是「在保证指尖不碰台面的前提下把抓手放到最低」，让指盒尽量多地
+# 覆盖方块：
+#     tcp 高度 = 台面 + 指尖间隙 + 指盒半长 = 0.0046 + 0.0185 = 0.0231 m
+# 抓取时 GenerateGraspPose 生成的位姿原点在**物体中心**，而 tcp 是两指夹持面
+# 中点，所以要补一个偏移；偏移取大了指尖会戳进台面 5.4 mm，实测报的是容差而
+# 不是碰撞（见 docs/踩坑记录.md 第 34 条）。
 FINGER_HALF_LEN = 0.0185
 FINGER_TIP_CLEARANCE = 0.0046
-GRASP_TCP_Z_OFFSET = FINGER_TIP_CLEARANCE + FINGER_HALF_LEN - OBJECT_XYZ[2]
+GRASP_TCP_Z = FINGER_TIP_CLEARANCE + FINGER_HALF_LEN
+GRASP_TCP_Z_OFFSET = GRASP_TCP_Z - OBJECT_XYZ[2]
+
+# 规划失败时要汇报的阶段名，顺序与流水线一致（含 SimpleGrasp 容器内部的）。
+# SimpleGrasp 是个 SerialContainer，MTC 的 Python 绑定没暴露 children()，
+# 没法遍历，只能按名字查。
+STAGE_NAMES = (
+    'current', 'connect', 'approach object', 'grasp', 'generate grasp pose',
+    'compute ik', 'close gripper', 'allow object collision', 'attach object',
+    'lift object', 'move to place', 'lower object', 'open gripper',
+    'forbid object collision', 'detach object', 'retreat after place',
+)
 
 
 def twist(frame, z):
@@ -190,6 +218,38 @@ def execute_solution(parts, timeout=180.0):
         rclpy.shutdown()
 
 
+def report_failures(task, names, limit=3):
+    """按阶段名打印失败原因。规划失败时调用。
+
+    为什么需要这个：MTC 自己只报「最靠后的那个阶段失败」，
+    前面真正的根因阶段被吞掉了。实测踩过两次：
+      · 放回段用 GeneratePlacePose + ComputeIK，报的是
+        「o5_2 pick and place: end interface (?) of 'place object'」，
+        真正的错是上一行「place pose IK: interface of 'generate place
+        pose' (← →) does not match external one (→ →)」—— 接口方向不匹配，
+        和「物体够不着」毫无关系。
+      · 候选抓取位姿全被 IK 否掉时，只报「没有可用解」，看不出是哪一环。
+
+    实现说明：MTC 的 Python 绑定没有暴露 children()，没法遍历容器，
+    所以只能按名字查（task['阶段名']）。查不到的阶段直接跳过。
+    失败信息在 stage.failures 里，每个元素带 comment。
+    """
+    for name in names:
+        try:
+            stage = task[name]
+        except Exception:       # noqa: BLE001 —— 名字不存在/不在本任务里，跳过
+            continue
+        fails = list(getattr(stage, 'failures', []) or [])
+        if not fails:
+            continue
+        print(f'  [{name}] {len(fails)} 条失败：', file=sys.stderr)
+        for f in fails[:limit]:
+            comment = getattr(f, 'comment', '') or '(无说明)'
+            print(f'      - {comment}', file=sys.stderr)
+        if len(fails) > limit:
+            print(f'      ... 另有 {len(fails) - limit} 条', file=sys.stderr)
+
+
 def add_object_to_scene():
     """把目标加进 move_group 的规划场景。
 
@@ -257,7 +317,7 @@ def main():
         # 的「正向」(→) 后面，否则报 cannot connect end interface。
         # Connect 是双向的，负责把两者接起来（主流水线里也有它）。
         probe_pipeline = core.PipelinePlanner(node)
-        probe_pipeline.planner = 'RRTConnectkConfigDefault'
+        probe_pipeline.planner = 'RRTConnect'
         probe.add(stages.Connect('probe connect', [(ARM_GROUP, probe_pipeline)]))
         pg = stages.GenerateGraspPose('generate grasp pose')
         pg.object = OBJECT_ID
@@ -292,20 +352,35 @@ def main():
         time.sleep(0.5)
         return 0
 
+    # launch 用环境变量把这个开关传进来（值形如 "true" / "false"）。
+    # 关掉它就退回「只抓不起」的老行为 —— 放回这一段是新加的，
+    # 出问题时能单独验证前半段，不用整体回退。
+    do_place = os.environ.get('MTC_PLACE', '').lower() in ('1', 'true')
+
     task = core.Task()
-    task.name = 'o5_2 pick'
+    task.name = 'o5_2 pick and place' if do_place else 'o5_2 pick'
     task.loadRobotModel(node)   # 参数由 launch 注入，见文件头说明
 
     # ① 起点：当前位形
     task.add(stages.CurrentState('current'))
 
-    # ② 规划到预抓取位形。规划器名取自 ompl_planning.yaml 的 arm 组配置。
-    #    注意名字是 RRTConnectkConfigDefault 而不是 RRTConnect：OMPL 的
-    #    planner_configs 由 moveit_configs_utils 合并默认配置（名字带
-    #    kConfigDefault 后缀），写成 RRTConnect 会 "Cannot find planning
-    #    configuration ... Will use defaults instead" —— 不报错，但悄悄退化。
+    # ② 规划到预抓取位形。规划器名取自 ompl_planning.yaml 里 arm 组的
+    #    planner_configs 列表，就写 'RRTConnect'。
+    #
+    #    【更正】这里原先写的是 'RRTConnectkConfigDefault'，注释里断言
+    #    「写成 RRTConnect 会 Cannot find planning configuration ... Will use
+    #    defaults instead」—— 结论正好反了。实测（本轮，MoveIt 2 humble）：
+    #    写 RRTConnectkConfigDefault 才会触发那句告警；写 RRTConnect 时
+    #    告警消失，改打印
+    #        Planner configuration 'arm[RRTConnect]' will use planner
+    #        'geometric::RRTConnect'
+    #    而且最优解代价从 6.53 掉到 3.89。
+    #    也就是说这个名字从来没生效过，ompl_planning.yaml 里那套
+    #    planner_configs 一直被忽略、规划器在用 OMPL 的裸默认参数 ——
+    #    又一处「安静地给错答案」：规划照常成功，只是解变差。
+    #    判据就一句日志：出现 "Will use defaults instead" 就是名字写错了。
     pipeline = core.PipelinePlanner(node)
-    pipeline.planner = 'RRTConnectkConfigDefault'
+    pipeline.planner = 'RRTConnect'
     # 速度缩放必须显式给，默认 1.0 会直接把执行打挂。
     # 实测的一条真实报文（默认值下）：
     #   [tolerances] State tolerances failed for joint 3:
@@ -425,8 +500,103 @@ def main():
     lift.group = ARM_GROUP
     lift.setDirection(twist('base_link', 1.0))
     lift.min_distance = 0.001
-    lift.max_distance = 0.050
+    lift.max_distance = LIFT_DISTANCE
     task.add(lift)
+
+    # ---------------------------------------------------------------------
+    # ⑨ 放回（Place）
+    #
+    # 拓扑与官方 demo 的 place 段一致：
+    #     移到放置点上方 → 下压 → 张开 → 恢复碰撞检查 → 摘手 → 撤离
+    # 顺序有硬依赖，不能调换：
+    #   · 下压必须在 detach 之前，否则方块在半空就掉下来；
+    #   · 张开必须在 forbid 之前 —— 手指还压在方块上，先恢复碰撞检查会
+    #     让「张开」这一段被判成碰撞；
+    #   · detach 必须在张开之后，否则夹爪张开了方块还挂在手上。
+    #
+    # 与官方的一处**有意**不同：官方用 GeneratePlacePose + ComputeIK 来指定
+    # 放置位姿（pose 属性给的是物体中心的位置），本工程改成用 MoveTo 直接给
+    # tcp 的目标位姿。原因是接口方向：
+    #   GeneratePlacePose 是反向(←)接口的生成器，ComputeIK 是 WrapperBase，
+    #   而 WrapperBase 的接口检查是【严格相等】的（ParallelContainerBase::
+    #   validateInterfaces）。把它放进串行容器的非首位，父级期望的接口与子阶段
+    #   的接口对不上，实测直接报：
+    #     place pose IK: interface of 'generate place pose' (← →) does not
+    #     match external one (→ →).
+    #   改成 MoveTo(PoseStamped) 之后整条 place 链全是正向(→ →)阶段，可以像
+    #   pick 链那样直接挂在 task 上，且每一段都产生真实轨迹 —— 官方那套里
+    #   ComputeIK 只改状态、不产生轨迹，机械臂并不会真的动到 IK 解。
+    #
+    # 放置点用 tcp 位姿表达而不是方块中心：tcp 落在「台面 + 指尖间隙 + 指盒
+    # 半长」= GRASP_TCP_Z 时，方块正好贴台面（与抓起时同一几何关系）。
+    # ---------------------------------------------------------------------
+    if do_place:
+        place_tcp = PoseStamped()
+        place_tcp.header.frame_id = 'base_link'
+        place_tcp.pose.position.x = PLACE_XYZ[0]
+        place_tcp.pose.position.y = PLACE_XYZ[1]
+        # 先抬到放置点上方 LIFT_DISTANCE 处再下压：关节空间搬运时方块离台面
+        # 足够高，不会一路刮着桌面过去。默认 PLACE_XYZ 与抓取点相同，此时
+        # 这一段就是纯竖直上移，路径必然无碰撞。
+        place_tcp.pose.position.z = GRASP_TCP_Z + LIFT_DISTANCE
+        place_tcp.pose.orientation.w = 1.0
+
+        # ⑨-1 把 tcp 搬到放置点上方。**必须用笛卡尔求解器**：
+        #     MoveTo 收到 PoseStamped 目标时走的是笛卡尔分支，调的是
+        #       planner_->plan(scene, link, offset, target, jmg, ...)
+        #     这个重载只有 CartesianPath 实现得了。喂 OMPL 的 PipelinePlanner
+        #     进去不会报「接口不对」，只会一路走到 OMPL 然后
+        #       [ompl] arm/arm: Unable to sample any valid states for goal tree
+        #       Invalid goal state
+        #       Failing stage(s): move to place (0/13): GOAL_STATE_INVALID
+        #     —— 13 条输入全灭，看起来像「目标不可达」，其实是调用方式错了。
+        #     别用 /compute_ik 去验这个目标：笛卡尔分支压根不做 IK。
+        #     默认 PLACE_XYZ 与抓取点相同时，这一段就是竖直上移 LIFT_DISTANCE，
+        #     与抬起的路径重合，稳。
+        transport = stages.MoveTo('move to place', cartesian)
+        transport.group = ARM_GROUP
+        transport.setGoal(place_tcp)
+        task.add(transport)
+
+        # ⑨-2 下压：笛卡尔直线下降，方块落到台面。
+        #     max_distance 与抬起的 LIFT_DISTANCE 配对。
+        #     min 依然取得小，理由同 approach：这条臂的位形贴着限位，
+        #     要求走满 50 mm 时笛卡尔路径可能只走得出 8 mm。
+        lower = stages.MoveRelative('lower object', cartesian)
+        lower.group = ARM_GROUP
+        lower.setDirection(twist('base_link', -1.0))
+        lower.min_distance = 0.001
+        lower.max_distance = LIFT_DISTANCE
+        task.add(lower)
+
+        # ⑨-3 张开夹爪。用 JointInterpolationPlanner 而不是 OMPL：
+        #     夹爪组只有 1 个自由度（left_claw_joint 是 mimic，不进组），
+        #     插值就是精确解，走 OMPL 反而是无谓的搜索。
+        #     goal='open' 是 SRDF 里的 group_state 名。
+        open_gripper = stages.MoveTo('open gripper', core.JointInterpolationPlanner())
+        open_gripper.group = GRIPPER_GROUP
+        open_gripper.setGoal('open')
+        task.add(open_gripper)
+
+        # ⑨-4 恢复手指与方块的碰撞检查。抓取时豁免过（手指是压进方块的），
+        #     现在方块要离开手指了，得把豁免撤掉，否则撤离时会带着一个
+        #     「永久可穿透」的物体 planning，碰撞检查等于形同虚设。
+        forbid = stages.ModifyPlanningScene('forbid object collision')
+        forbid.allowCollisions(OBJECT_ID, False)
+        task.add(forbid)
+
+        # ⑨-5 摘下方块：方块从「挂在爪上」变回「躺在台面上」。
+        release = stages.ModifyPlanningScene('detach object')
+        release.detachObject(OBJECT_ID, ATTACH_LINK)
+        task.add(release)
+
+        # ⑨-6 撤离：手往上抬，把方块留在台面上。
+        retreat = stages.MoveRelative('retreat after place', cartesian)
+        retreat.group = ARM_GROUP
+        retreat.setDirection(twist('base_link', 1.0))
+        retreat.min_distance = 0.001
+        retreat.max_distance = LIFT_DISTANCE
+        task.add(retreat)
 
     print(f'目标 {OBJECT_ID}，5 自由度臂 + position_only_ik，开始规划 ...')
     t0 = time.time()
@@ -434,8 +604,10 @@ def main():
     print(f'规划耗时 {time.time() - t0:.1f} s，结果：{"成功" if ok else "失败"}')
 
     if not ok:
-        print('没有可用解。可能原因：候选全被 IK 否掉、目标超出可达范围、'
-              '或起始位形已碰撞。', file=sys.stderr)
+        print('没有可用解。下面是逐阶段的失败原因 —— 别只看最后一行，'
+              'MTC 只会报「最靠后的那个阶段失败」，根因往往在更前面。',
+              file=sys.stderr)
+        report_failures(task, STAGE_NAMES)
         return 1
 
     solutions = task.solutions

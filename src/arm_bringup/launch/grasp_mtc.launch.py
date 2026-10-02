@@ -18,6 +18,7 @@
     ros2 launch arm_bringup grasp_mtc.launch.py
     ros2 launch arm_bringup grasp_mtc.launch.py display:=true   # 发到 RViz 的 MTC 面板
     ros2 launch arm_bringup grasp_mtc.launch.py execute:=true   # 规划完直接执行
+    ros2 launch arm_bringup grasp_mtc.launch.py place:=false     # 只抓不起（调试用）
 """
 
 from launch import LaunchDescription
@@ -39,6 +40,7 @@ def generate_launch_description():
     display = LaunchConfiguration("display")
     execute = LaunchConfiguration("execute")
     probe = LaunchConfiguration("probe")
+    place = LaunchConfiguration("place")
     use_sim_time = LaunchConfiguration("use_sim_time")
 
     return LaunchDescription([
@@ -52,6 +54,10 @@ def generate_launch_description():
             "probe", default_value="false",
             description="诊断：只生成抓取候选并打印它们的位姿，不做 IK"),
         DeclareLaunchArgument(
+            "place", default_value="true",
+            description="是否接放回（Place）阶段。false = 只抓不起，"
+                        "退回 4ff2c23 之前的老行为"),
+        DeclareLaunchArgument(
             "use_sim_time", default_value="true",
             description="跟着 Gazebo 的 /clock 走时间（仿真时必须 true）"),
 
@@ -59,6 +65,7 @@ def generate_launch_description():
         SetEnvironmentVariable(name="MTC_DISPLAY", value=display),
         SetEnvironmentVariable(name="MTC_EXECUTE", value=execute),
         SetEnvironmentVariable(name="MTC_PROBE", value=probe),
+        SetEnvironmentVariable(name="MTC_PLACE", value=place),
 
         Node(
             package="arm_bringup",
