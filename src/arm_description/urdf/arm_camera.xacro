@@ -25,9 +25,14 @@
   ============================================================================
   关于传感器：本文件用 Gazebo **Fortress（gz-sim 6）** 语法
   ============================================================================
-  · Fortress 的传感器靠 gz-transport 发原始话题（默认 /wrist_cam/image、
-    /wrist_cam/camera_info），要经 ros_gz_bridge 才能变成 ROS 2 话题
-    —— 对应 arm_gazebo/config/arm_bridge.yaml 里的两条桥接。
+  · 传感器类型是 rgbd_camera，同时出彩色图、深度图与点云，共四个 gz 话题：
+        /wrist_cam/image         （彩色）
+        /wrist_cam/depth_image   （深度）
+        /wrist_cam/points        （点云）
+        /wrist_cam/camera_info   （内参）
+    它们都要经 ros_gz_bridge 才能变成 ROS 2 话题 —— 彩色与深度走
+    ros_gz_image 的 image_bridge，点云与内参走 parameter_bridge，
+    对应 arm_gazebo/launch/gz_launch.py 与 arm_gazebo/config/arm_bridge.yaml。
   · 不要在这里加 libgazebo_ros_camera.so：那是 Gazebo Classic 的写法，
     Fortress 里找不到这个插件，会静默不发图。
   · <gz_frame_id> 只负责给消息盖 frame_id 戳，不改变传感器朝向。
@@ -112,37 +117,35 @@
     </joint>
 
     <!-- ============================================================
-         四、Gazebo Fortress 相机传感器
+         四、Gazebo Fortress 深度相机传感器（RGBD）
 
          换相机时改这里的 fov / 分辨率 / 噪声参数
-         话题：gz 侧 /wrist_cam/image、/wrist_cam/camera_info
+         话题见文件头「关于传感器」，共 image / depth_image / points / camera_info
+
+         为什么是 rgbd_camera 而不是 camera：
+           抓取流水线要的是物体的三维位姿。单目 RGB 只能靠「已知边长 + PnP」
+           反推，物体尺寸未知或颜色不分时就没办法；RGBD 直接给点云，物体位姿
+           可以从平面分割 + 欧式聚类得到，不依赖任何先验。
+           真机选型也倾向深度相机（见文件头「尺寸说明」），仿真与真机保持一致。
+
+         注意：update_rate 与分辨率直接决定仿真能不能跑快，而深度渲染比彩色贵。
+           Fortress 的 Sensors 系统在 PostUpdate 里等渲染线程出图，相机一慢，
+           整个仿真循环就被它拖住。本机是软件渲染（llvmpipe），所以按
+           320x240@10Hz 起步，实测实时因子后再定要不要再降。
 
          注意：只有**传感器**受 enable_sensor 控制，上面的 link 与关节始终存在。
             （SRDF 里引用了 wrist_cam_link / wrist_cam_optical_frame 做碰撞
              矩阵，link 一旦缺失 MoveIt 会报未知连杆。）
-            关掉传感器省的是渲染开销——Fortress 的 Sensors 系统在 PostUpdate
-            里等渲染线程出图，相机会拖住整个仿真循环。
+            关掉传感器省的是渲染开销。
          ============================================================ -->
     <xacro:if value="${enable_sensor}">
     <gazebo reference="wrist_cam_link">
-      <sensor name="wrist_cam" type="camera">
+      <sensor name="wrist_cam" type="rgbd_camera">
         <pose>0 0 0 0 0 0</pose>
         <always_on>1</always_on>
-        <!--
-          注意：update_rate 与分辨率直接决定仿真能不能跑快。
-          Gazebo Fortress 的 Sensors 系统在 PostUpdate 里等渲染线程出图，
-          相机渲染一慢，整个仿真循环就被它拖住 —— 实测 640x480@30Hz
-          （软件渲染，本机只跑到 ~3 Hz）会把实时因子压到 0.14。
-          这里退到 320x240@10Hz：面积省 4 倍、频率省 3 倍。
-
-          本相机是「占位尺寸」，眼下还没有任何算法消费它的图像
-            （没有 octomap、没有检测），所以降规格不损失任何能力。
-            真要做视觉标定/检测时再按需调回去，或改用
-            `ros2 launch arm_gazebo gz_launch.py camera:=false` 整个关掉。
-        -->
         <update_rate>10</update_rate>
         <visualize>false</visualize>
-        <topic>wrist_cam/image</topic>
+        <topic>wrist_cam</topic>
         <gz_frame_id>wrist_cam_optical_frame</gz_frame_id>
         <camera name="wrist_cam">
           <horizontal_fov>${60.0 * cam_deg_to_rad}</horizontal_fov>
@@ -155,10 +158,20 @@
             <near>0.02</near>
             <far>10</far>
           </clip>
+          <!--
+            注意：这个 stddev 会同时作用在彩色图和深度图上，而且作用在深度上时
+            单位是【米】。原来写 0.007，等于给深度加了 7 mm 噪声 —— 目标方块才
+            25 mm 高，噪声直接把它淹掉：实测地面点的 z 散成 ±20 mm，任何靠 z 阈值
+            的地面分割都会失效（分出来的是一个 160x120 mm 的薄片，不是那个方块）。
+
+            真实深度相机在 10 cm 处的深度噪声不到 2 mm（这也是本臂的典型观测
+            距离），所以取 0.001：彩色图仍有轻微噪声，深度 1 mm 也符合该距离下
+            的实际水平。要做抗噪鲁棒性测试时再单独调大，别把它当默认值留在模型里。
+          -->
           <noise>
             <type>gaussian</type>
             <mean>0.0</mean>
-            <stddev>0.007</stddev>
+            <stddev>0.001</stddev>
           </noise>
         </camera>
       </sensor>

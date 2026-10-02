@@ -5,8 +5,8 @@
 
     ① robot_state_publisher  把 xacro 展开成 URDF，发布 /robot_description 与 TF
     ② Gazebo Fortress        -r 表示「立即开始跑」，不要停在暂停状态
-    ③ parameter_bridge       把 gz 的 clock / camera_info 桥到 ROS 2
-    ④ image_bridge           把腕部相机的图片桥到 ROS 2（camera:=false 时不起）
+    ③ parameter_bridge       把 gz 的 clock / camera_info / points 桥到 ROS 2
+    ④ image_bridge           把腕部相机的彩图与深度图桥到 ROS 2（camera:=false 时不起）
     ⑤ ros_gz_sim create      从 /robot_description 话题把机器人生成进世界
     ⑥ controller spawner     依次激活 joint_state_broadcaster 与两个轨迹控制器
 
@@ -115,8 +115,9 @@ def generate_launch_description():
                   output='screen')
 
     # ④ 相机图片桥（相机没开就别起了）
+    #    rgbd_camera 出彩图与深度图两张，都走这里；点云与内参在 ③ 的 yaml 里。
     image_bridge = Node(package='ros_gz_image', executable='image_bridge',
-                        arguments=['/wrist_cam/image'],
+                        arguments=['/wrist_cam/image', '/wrist_cam/depth_image'],
                         output='screen',
                         condition=IfCondition(camera))
 

@@ -25,3 +25,11 @@
   ros_type_name: "sensor_msgs/msg/CameraInfo"
   gz_type_name: "gz.msgs.CameraInfo"
   direction: GZ_TO_ROS
+
+# 相机点云（rgbd_camera 由深度图生成，免去自己从 depth 反投影）。
+# 彩色与深度两张图走 image_bridge（零拷贝路径），点云类型不同，只能走这里。
+- ros_topic_name: "/wrist_cam/points"
+  gz_topic_name: "/wrist_cam/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
