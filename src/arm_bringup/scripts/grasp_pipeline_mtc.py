@@ -410,6 +410,24 @@ def main():
     # 给的，所以「摆位形」必须发生在「加物体」之前。
     # ---------------------------------------------------------------------
     do_perceive = os.environ.get('MTC_PERCEIVE', '').lower() in ('1', 'true')
+
+    # 先验位姿的外部覆盖，格式 "x,y,z"。仅供测试与标定用 ——
+    # 它的用途是把「方块实际在哪」与「感知说它在哪」解耦：感知工作区与抓取
+    # 工作区需要分别表征，关掉感知再把先验位姿指到真实位置，就能单独测抓取。
+    # （不这么做的话，perceive:=false 仍会用 OBJECT_XYZ 去建场景，与实物对不
+    #  上，流水线会「执行完成」但其实抓的是空气 —— 这种假成功最难识别。）
+    prior = os.environ.get('MTC_PRIOR_XYZ', '').strip()
+    if prior:
+        try:
+            vals = tuple(float(v) for v in prior.split(','))
+            if len(vals) != 3:
+                raise ValueError('需要 3 个数')
+            OBJ_POSE[0], OBJ_POSE[1], OBJ_POSE[2] = vals
+            print(f'先验位姿被 MTC_PRIOR_XYZ 覆盖为 {vals}')
+        except ValueError as exc:
+            print(f'MTC_PRIOR_XYZ 格式错误（{prior!r}）：{exc}', file=sys.stderr)
+            return 8
+
     if do_perceive:
         print('把臂摆到扫描位形（SRDF grasp_ready）...')
         if not send_joint_target(ARM_ACTION, ARM_JOINTS, SCAN_POSE, SCAN_POSE_SEC):
