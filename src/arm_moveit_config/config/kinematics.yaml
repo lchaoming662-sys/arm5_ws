@@ -55,6 +55,7 @@
 #   · 根因：KDL **没有代价函数的概念**。它给「唯一那个解」，
 #     无法表达「同样满足位置约束时，离限位远一点的那个更好」。
 #     Pick-IK 可以 —— 这是换求解器的全部意义所在。
+# [test/pick-ik-compare] 对比测试结束，恢复 KDL 生效（pick_ik 段在下方重新注释）
 arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.005
