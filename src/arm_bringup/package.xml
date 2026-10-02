@@ -23,6 +23,17 @@
   <exec_depend>arm_gazebo</exec_depend>
   <exec_depend>arm_moveit_config</exec_depend>
 
+  <!-- MTC 抓取流水线：grasp_mtc.launch.py + scripts/grasp_pipeline_mtc.py。
+       MTC 的 Python 绑定在 core 包里，且建在 rclcpp 上（不是 rclpy），
+       所以还需要 py_binding_tools 提供 rclcpp 的 Python 模块。 -->
+  <exec_depend>moveit_task_constructor_core</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>shape_msgs</exec_depend>
+  <exec_depend>py_binding_tools</exec_depend>
+  <!-- tools/scene_object.py 用 rclpy，它把目标加进 move_group 的规划场景 -->
+  <exec_depend>rclpy</exec_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>

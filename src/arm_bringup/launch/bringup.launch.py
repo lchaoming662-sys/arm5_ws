@@ -94,7 +94,10 @@ def generate_launch_description():
     gate = Node(
         package='arm_bringup',
         executable='wait_for_controllers.py',
+        # --reactivate：全部就绪之后再让夹爪控制器重新申领一次命令接口。
+        # 不做这一步，right_claw_joint 就完全不动（原因见该脚本的说明）。
         arguments=['--controllers'] + READY_CONTROLLERS
+                  + ['--reactivate', 'gripper_controller']
                   + ['--timeout', gate_timeout],
         output='screen',
         condition=IfCondition(use_moveit),
