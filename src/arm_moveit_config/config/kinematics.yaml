@@ -1,25 +1,60 @@
 # ============================================================================
 # kinematics.yaml — 逆运动学求解器
+#
+# ⚠️ 本文件提供**两份配置**：当前生效的是 KDL，Pick-IK 那份整段注释掉。
+#    切换方法见「怎么切到 Pick-IK」一节。
 # ============================================================================
-# 本机只装了 KDL（没有 pick_ik / trac_ik / bio_ik），所以只能用它。
 #
-# 注意：position_only_ik: true 是这条臂能用 MoveIt 的关键
+# ---------------------------------------------------------------------------
+# 5 自由度与 position_only_ik（对两个求解器都成立）
+# ---------------------------------------------------------------------------
+# 本臂只有 5 个自由度（top_plate_joint..claw_base_joint），而完整 6D 位姿
+# IK 需要 6 个独立约束 —— 5 个自由度**永远解不出来**。表现为 RViz 里拖目标
+# 位姿后 Plan 一直失败，报"Unable to find a valid IK solution"，
+# 而且不告诉你为什么（docs/踩坑记录.md 第 17 条）。
 #
-#   本臂只有 5 个自由度（top_plate_joint..claw_base_joint）。KDL 默认要做【完整 6D 位姿】IK，
-#   5 自由度永远解不出来 —— 表现为 RViz 里拖目标位姿后 Plan 一直失败，
-#   报 "Unable to find a valid IK solution"，而且不告诉你为什么。
+# 所以必须做「只解位置」，两个求解器的开关**名字不一样**：
+#   KDL      : position_only_ik: true
+#   Pick-IK  : rotation_scale: 0.0        ← 这是它原生的开关
+# Pick-IK 用 rotation_scale=0 而不是 position_only_ik 的原因是：
+# 它连带会**忽略 orientation_threshold 的检查**（官方文档明确说明）。
+# 这对我们恰好有利 —— 5 自由度下姿态本来��由求解器自由分配，
+# 拿姿态阈值去卡它只会把合法解误杀。
 #
-#   开启 position_only_ik 后，KDL 只用位置（3 个约束）参与求解，
-#   剩下的姿态自由度由它自行分配 —— 对抓取/取放这类任务足够用。
+# 验证是否生效：
+#     ros2 service call /compute_ik moveit_msgs/srv/GetPositionIK \
+#       "{ik_request: {group_name: arm, ik_link_name: tcp, \
+#         pose_stamped: {header: {frame_id: world}, \
+#           pose: {position: {x: 0.027, y: 0.12, z: 0.25}, \
+#                  orientation: {w: 1.0}}}}}"
+#   判据：返回的 result.ik_link_name 非空。
 #
-#   验证是否生效：
-#       ros2 service call /compute_ik moveit_msgs/srv/GetPositionIK \
-#         "{ik_request: {group_name: arm, ik_link_name: tcp, \
-#           pose_stamped: {header: {frame_id: world}, \
-#             pose: {position: {x: 0.027, y: 0.12, z: 0.25}, \
-#                    orientation: {w: 1.0}}}}}"
+# 验证求解器**确实是** Pick-IK（而不是配置没加载、静默退回 KDL）：
+#     ros2 param get /move_group \
+#       robot_description_kinematics.arm.kinematics_solver
+#   判据：输出 pick_ik/PickIkPlugin。
+#   这一步必须单独查 —— 参数没加载时 MoveIt 不会报错，只是照旧用 KDL，
+#   于是你会以为「Pick-IK 也没用」，而它压根没被加载过。
 # ============================================================================
 
+# ============================================================================
+# 当前生效：KDL
+# ============================================================================
+# 为什么还用 KDL：本机 apt 源里**有** pick_ik，只是还没装：
+#   $ apt-cache policy ros-humble-pick-ik
+#     候选： 1.1.2-2jammy.20260908.074316
+# 所以这不是「装不上」，装法见文末。
+#
+# KDL 在这条臂上的已知问题（实测，踩坑记录第 17/31 条）：
+#   · 完整 6D IK 无解 → 必须 position_only_ik
+#   · 开启后 KDL 只用位置（3 个约束）求解，剩下的姿态自由度由它
+#     「自行分配」—— 而它分配的方式是把**腕关节推到限位上**。
+#     实测抓取位形下 wrist 与 claw_base 都跑到 -1.57080（正好是 URDF
+#     硬限位），而 arm_controller 的 trajectory 容差是 0.12 rad，
+#     claw_base 余量只剩 1.5 倍 —— 那次 CONTROL_FAILED(-4) 就是这么来的。
+#   · 根因：KDL **没有代价函数的概念**。它给「唯一那个解」，
+#     无法表达「同样满足位置约束时，离限位远一点的那个更好」。
+#     Pick-IK 可以 —— 这是换求解器的全部意义所在。
 arm:
   kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
   kinematics_solver_search_resolution: 0.005
@@ -27,6 +62,104 @@ arm:
   kinematics_solver_attempts: 5
   position_only_ik: true
 
+# ============================================================================
+# 怎么切到 Pick-IK
+# ============================================================================
+#   1) sudo apt install ros-humble-pick-ik
+#   2) 把下面「备选：Pick-IK」整段取消注释，把上面 KDL 段注释掉
+#   3) colcon build --symlink-install --packages-select arm_moveit_config
+#   4) **重启 move_group**（参数是启动时读的，热重载不生效）
+#   5) 跑上面那三条验证：求解器名/ compute_ik 有解 / wrist 离限位有余量
+#
+# 验收判据（第 5 步的核心）：
+#     ros2 param get /move_group \
+#       robot_description_kinematics.arm.kinematics_solver
+#       → pick_ik/PickIkPlugin
+#     然后对同一组抓取目标调 /compute_ik，看返回的 wrist_joint 值：
+#     必须**明显小于** joint_limits.yaml 里的软限位 1.50。
+#     若仍顶在 1.50 附近 → 代价函数没起作用（见 cost_threshold 的注释），
+#     或者自定义代价函数没注册上（它不在 kinematics.yaml 里，
+#     见 grasp_pipeline_mtc.py 的 register_limit_cost()）。
+#
+# 回退：把 KDL 段恢复、Pick-IK 段重新注释，重启 move_group。
+# 不需要重装任何东西 —— 这是把它做成配置而不是代码的原因。
+# ============================================================================
+
+# ============================================================================
+# 备选：Pick-IK（装上后启用）
+# ============================================================================
+# ---- 逐参数说明（数值都给了依据，不是抄官方示例）----
+# arm:
+#   kinematics_solver: pick_ik/PickIkPlugin
+#
+#   # 超时必须比 KDL 大。mode: global 会在这个窗口内反复跑演化算法，
+#   # 0.05 s 只够跑很少几代。实测 KDL 用 0.05 就够（它快速收敛），
+#   # Pick-IK 的 global 慢一个量级。
+#   # 代价：规划变慢。本机 RTF 只有 0.14~0.48，规划慢会直接拉长
+#   # 一次抓取的墙上时间。0.2 是「够用又不至于卡住」的折中；
+#   # 若 IK 偶发失败，**先**加到 0.5，别急着动别的参数。
+#   kinematics_solver_timeout: 0.2
+#
+#   # global 模式下这个参数主要由演化算法自己决定迭代次数，
+#   # 但要留着：MoveIt 用它决定同一目标最多试几次。
+#   kinematics_solver_attempts: 5
+#
+#   # local = 只做梯度下降（快）；global = 再叠加演化算法
+#   #（慢，但能跳出局部极小）。
+#   # 为什么这条臂**需要** global：KDL 的失败模式恰恰就是
+#   # 「掉进局部极小」—— 它从当前位形出发梯度下降，卡住就报无解。
+#   # Pick-IK 的 global 在整个解空间里找，不依赖初值，
+#   # 这对「GenerateGraspPose 一次要解 25 个分散的候选」很关键。
+#   mode: global
+#
+#   # 位置权重，1.0 = 位置误差直接进代价函数。
+#   position_scale: 1.0
+#
+#   # 【关键】0.0 = 只解位置，这是 5 自由度臂的正解。见文件头。
+#   rotation_scale: 0.0
+#
+#   # 位置精度阈值（米）。0.001 = 1 mm。
+#   # 为什么不再严：tcp 的对位精度由**手指几何**决定，不由 IK 精度决定 ——
+#   # 零位两指夹持面间距 29.28 mm，夹25 mm 方块每侧留 2.14 mm 余量
+#   #（推导见 arm_world.sdf 的注释）。1 mm 的 IK 误差吃掉不到一半余量。
+#   position_threshold: 0.001
+#   orientation_threshold: 0.01     # rotation_scale=0 时被忽略，留着做文档
+#
+#   # 【决定「腕关节会不会顶限位」的那一个参数】
+#   # pick_ik 的优化目标是一个标量 cost，由位置误差 + 最小位移 +
+#   # **自定义代价函数**（我们注册了一项「关节越靠近限位代价越高」）组成。
+#   # 只有 cost < cost_threshold 才算求解成功。
+#   #
+#   # 也就是说：**这个阈值是「离限位多远」与「位置准不准」之间的取舍旋钮**。
+#   #   · 定得太松 → 求解器接受「位置已达标、但关节贴在限位上」的解，
+#   #     于是控制器容差违规照旧（这正是 KDL 现在的毛病）。
+#   #   · 定得太紧 → 优化器找不到满足条件的解，IK 直接失败，
+#   #     表现为「明明够得着却规划不出来」。
+#   #
+#   # 为什么从 1e-4 起步：位置项量级 = position_scale × 位置误差(m)，
+#   # 1 mm 误差 → 0.001。限位代价项我们归一化到 0~1（见
+#   # grasp_pipeline_mtc.py 的 register_limit_cost() 注释）。
+#   # 所以 1e-4 的含义是「位置必须比 0.1 mm 更准，或者限位代价低于 1e-4」。
+#   # **装上之后必须实测校准**：看 wrist_joint 解出来离 1.50 还剩多少
+#   # 余量，再据此调。若 IK 失败率变高就放宽到 1e-3。
+#   cost_threshold: 0.0001
+#
+#   # 最小位移权重：解与「初始猜测」的关节角差异。
+#   # 为什么给 0：官方文档明确说「解远方的目标时留 0，否则会平白抬高
+#   # 代价」。GenerateGraspPose 一次要解 25 个候选、位形跨度大，留 0 更合适。
+#   # 若笛卡尔插值段（MTC 的 approach / lift）出现关节跳变，
+#   # 再回来调到 0.001。
+#   minimal_displacement_weight: 0.0
+#
+#   # 梯度下降步长。默认 1e-4。调大会收敛快但容易在容差附近震荡，
+#   # 表现为 IK 偶发失败（社区里报-31 的就是这个原因）。
+#   gd_step_size: 0.0001
+#
+#   # global 模式的线程数。本机 20 核给 4 足够；别给满，
+#   # 因为仿真本身已经稳定吃满一个核（实测 RTF 0.14~0.48）。
+#   memetic_num_threads: 4
+
+# ============================================================================
 # 【已删】这里原先还给 gripper 组配了一份 KDL 求解器，但 gripper 不是 chain
 # （它是两个独立的指关节 right_claw_joint / left_claw_joint，没有共同末端），
 # KDL 对非 chain 组直接拒绝，于是每次加载机器人模型都刷三条 ERROR：
@@ -39,3 +172,4 @@ arm:
 # 不需要 IK。留着它只会让人以为夹爪也走 IK。
 #
 # 真要给夹爪做 IK，得先把它改成 chain（补一个固定的 palm 连杆），那是另一件事。
+# ============================================================================

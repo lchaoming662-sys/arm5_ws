@@ -57,6 +57,22 @@
              UserCommands      允许外部下命令（生成机器人）——缺了 spawn 失败
              SceneBroadcaster  对外发布场景信息——缺了界面一片空白
          Sensors 是本项目额外需要的：腕部相机靠它出图。
+
+         【新增】Contact —— 接触传感器系统。**加它是因为 target_cube 下面
+         那个 <sensor type="contact"> 需要它**，这一条是上游示例里明确
+         写着的（gz-sim ign-gazebo6/examples/worlds/contact_sensor.sdf）：
+
+             <plugin filename="ignition-gazebo-contact-system"
+                     name="gz::sim::systems::Contact"/>
+
+         不加会怎样：世界照常加载、不报任何错，只是 contact 传感器
+         **永远不发消息**。这正是本工程最忌讳的那类失效 ——
+         「安静地不工作」。判据：抓取流水线读到的接触力恒为 0，
+         而你无法区分「没夹到东西」和「传感器根本没上线」。
+
+         注意文件名与命名空间不一致（ignition-gazebo- 前缀配gz:: 命名空间）
+         是 Fortress 的正常写法，不是笔误。Fortress 属于过渡期版本，
+         官方插件都长这样，别"顺手改成 gz-sim- 前缀"—— 那样反而找不到库。
          ==================================================== -->
     <plugin filename="ignition-gazebo-physics-system"
             name="ignition::gazebo::systems::Physics"/>
@@ -64,6 +80,8 @@
             name="ignition::gazebo::systems::UserCommands"/>
     <plugin filename="ignition-gazebo-scene-broadcaster-system"
             name="ignition::gazebo::systems::SceneBroadcaster"/>
+    <plugin filename="ignition-gazebo-contact-system"
+            name="gz::sim::systems::Contact"/>
     <plugin filename="ignition-gazebo-sensors-system"
             name="ignition::gazebo::systems::Sensors">
       <render_engine>ogre2</render_engine>
@@ -134,6 +152,53 @@
             <diffuse>0.2 0.6 0.9 1</diffuse>
           </material>
         </visual>
+
+        <!-- ============================================================
+             接触传感器 —— 「到底抓到没有」的物理判据来源
+             ============================================================
+             为什么必须读物理量，而不看 MoveIt 的 attached_collision_object：
+               那个字段是**规划场景的语义状态**，说的是「我打算让这个物体
+               跟着这个连杆走」。它由 ModifyPlanningScene 阶段无条件写入，
+               与 Gazebo 里方块实际受不受力、动不动得毫无关系。
+               实测踩过的坑：有一轮抬起只上升 0.5 mm（抓的是空气），
+               MTC 依然报 SUCCESS、attached_collision_object 也是齐的，
+               流水线照打「执行完成」（docs/踩坑记录.md 第 45 条）。
+               语义状态说「成功」，物理状态说「没抓到」，而后者才是事实。
+
+             语法照抄上游示例 gz-sim/examples/worlds/contact_sensor.sdf
+             （ign-gazebo6 分支），三处容易写错的地方：
+               · <sensor> 是 <link> 的**子元素**，不能放在 <model> 下
+               · <contact> 下的 <collision> 填**碰撞体的名字**（纯文本），
+                 不是再写一个完整的 <collision> 元素
+               · <topic> 用绝对路径
+
+             依赖第 2 节里新加的 Contact 系统插件。没有它，世界照常加载、
+             不报任何错，只是这个传感器**永远不发消息** —— 而你无法区分
+             「没夹到东西」和「传感器根本没上线」。
+
+             update_rate 100 Hz，与 controller_manager 对齐：抓取验证要看
+             「接触力持续了多久」，采样太稀会把持续时间算短。代价很小 ——
+             接触消息只在**有接触时**才发。
+
+             【这个传感器能回答什么、不能回答什么】
+             能：方块有没有在受力、力有多大（→判断「夹住了」）。
+             不能：力是谁施加的。方块贴地时也一定有接触力（地面托着它），
+             所以「接触力 > 0」单独用**不足以**证明抓取成功 ——
+                   方块一直躺在桌上，它的接触力也一直 > 0。
+             因此流水线里的判据是两条**联合**使用：
+               ① 峰值 z 抬升 > 30 mm   ← 只有被夹住并抬起才会发生
+               ② 夹持期间接触力 > 0且持续 > 0.5 s
+             单看① 会被「顶起来又掉了」误判为成功，所以还要② 来确认
+             在运动过程中始终保持接触。详见 tools/grasp_verify.py。
+             ============================================================ -->
+        <sensor name="contact_sensor" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>collision</collision>
+            <topic>/target_cube/contact</topic>
+          </contact>
+        </sensor>
       </link>
     </model>
 

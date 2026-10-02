@@ -19,10 +19,26 @@
 分割思路：
   视野里绝大多数点是地面，所以先取 z 的直方图峰值当地面高度，把地面附近
   的点剔掉，剩下的做体素连通域聚类，取最大的一簇当目标。
-  纯 numpy + scipy.ndimage 实现，不依赖 PCL / open3d（本机没装）。
 
+有效性判据（本轮改动，见 tools/geometry_validity.py）：
+  聚类之后**不再**用「跨度」判有效性，而是做前置拒绝的多重几何验证：
+    ① 面残差（扣除观察倾斜后）< 4 mm  —— 它是一块**面**，不是一堆乱点
+    ② 主平面上凸包面积比∈ [0.6, 2.0] —— 它**只占**这么大地方
+    ③ 法向一致性 E[1-|cosθ|] < 0.25   —— 表面朝向一致
+  三项全过才输出位姿，任一不过直接退出（退出码 8）。
+  中心估计改为MCD（最小协方差行列式）剔离群 + p1p99 分位。
+
+  为什么换掉跨度判据：跨度只度量「看到了多宽」，对「这是不是一块
+  **完整**的物体」没有任何判断力。实测（docs/踩坑记录.md 第 42 条）
+  目标被手指挡掉一半时，碎片在 x 方向仍有 25 mm 宽，跨度放行而中心
+  偏了 3~4 mm；更糟的��况下偏 10 mm，流水线照用。
+
+  阈值的标定过程见 tools/calib/ 下两个脚本。**改阈值前必须重跑它们** ——
+  判据数值来自实测，不是拍的。
+
+注意（两条既有的坑，都保留）：
   注意点云是在相机系里的，单位是米，但相机装在腕上会随臂运动，
-  所以先经 TF 转到 base_link 再做几何判断。真值对照也在 base_link 下做，
+  所以先经 TF 转到 base_link 再做几何判断。真值对照也在base_link 下做，
   两边参考系必须一致，否则误差里混进的是坐标系差异而不是算法误差。
 """
 import argparse
@@ -50,6 +66,7 @@ import tf2_ros
 # 俯抓姿态下指尖离方块顶面只有 1.8 mm，离镜头的距离也几乎一样。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from grasp_geometry import fk as arm_fk, BOX as CLAW_BOX  # noqa: E402
+from geometry_validity import validate_and_estimate  # noqa: E402
 
 POINTS_TOPIC = '/wrist_cam/points'
 JOINTS_TOPIC = '/joint_states'
@@ -327,78 +344,86 @@ def main():
     print(f'  聚成 {len(clusters)} 簇，取最大的一簇')
 
     obj = clusters[0]
-    lo, hi = obj.min(axis=0), obj.max(axis=0)
-    bbox_c = (lo + hi) / 2.0
 
-    # 中心估计用 1/99 分位的区间中点，而不是包围盒中心。
+    # ==================================================================
+    # 前置拒绝的多重几何验证（tools/geometry_validity.py）
+    # ==================================================================
+    # 下面这一段取代了原先的「跨度判据」（min-span-ratio / max-span-ratio）。
     #
-    # 实测（臂在 grasp_ready、方块在工作位，8 帧）：
-    #     估计量      x 均值   x 最差    y 均值   y 最差
-    #     bbox       -1.18    1.86     +0.45    0.57     ← 原来用的
-    #     centroid   -0.41    0.43     +3.27    3.33     ← y 上被第二瓣拽走
-    #     p1p99      -0.87    1.06     +0.81    0.98     ← 最差值最小
-    #     p2p98      -0.58    0.67     +1.08    1.28
-    # bbox 的问题是 min/max 对稀疏尾点太敏感：顶面远边那几个点每箱只有个位数，
-    # 却能把边界拉出去好几毫米。质心更糟 —— 视野里除了顶面还有一片"第二瓣"
-    # （掠射角下地面残留），y 方向被它拽偏 3 mm 以上。
-    # 1/99 分位把两端的稀疏尾点修掉，最差误差从 1.86 降到 1.06 mm。
-    x_lo, x_hi = np.percentile(obj[:, 0], 1.0), np.percentile(obj[:, 0], 99.0)
-    y_lo, y_hi = np.percentile(obj[:, 1], 1.0), np.percentile(obj[:, 1], 99.0)
-    center = np.array([0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi)])
-    size = np.array([x_hi - x_lo, y_hi - y_lo, hi[2] - lo[2]])
+    # 为什么换掉跨度判据：
+    #   跨度只度量「看到了多宽」，它对两件事一无所知 ——
+    #     ① 这块点云是不是一个**完整**的物体。目标被手指挡掉一半，
+    #        剩下的碎片在 x 方向仍可能有 25 mm 宽，跨度放行，
+    #        而中心已经偏了 3~4 mm（实测，见 docs/踩坑记录.md 第 42 条）。
+    #     ② 这块点云是不是**一个**物体。粘连时跨度暴涨，跨度判据
+    #        用「过大」那一侧挡，但那是唯一一次侥幸：粘连发生在
+    #        厚度方向时跨度依然完美。
+    #   三重验证（平面性 / 凸包面积 / 法向一致性）各自堵一个洞，
+    #   且互相不相关。中心估计也从 bbox 中心换成 MCD + p1p99。
+    #
+    # 阈值与失效边界都标定在 tools/calib/ 里，改任何一个之前
+    # 请重跑那些脚本 —— 判据的数值来自实测，不是拍脑袋。
+    print(f'\n=== 几何验证（{args.frame} 系）===')
+    try:
+        vres = validate_and_estimate(obj, args.expect_size, frame=args.frame)
+    except Exception as exc:                      # noqa: BLE001
+        # 验证模块自己抛错 = 几何不合格，是**正常的业务结果**
+        # （目标没看全，换个位置再来），不是程序故障。
+        print(f'  ✗ {exc}', file=sys.stderr)
+        print('    解决办法：把目标移到视野中心附近，或调整扫描位形。'
+              '不要在结果可疑时继续用。', file=sys.stderr)
+        node.destroy_node()
+        rclpy.shutdown()
+        return finish(8)
+
+    print(f'  {vres.summary()}')
+    for name, (ok, val, thr) in vres.checks.items():
+        print(f'    {"✓" if ok else "✗"} {name:20s} 实测 {val:>18s}'
+              f'   要求 {thr}')
+    if not vres.ok:
+        print(f'\n  ✗ 几何验证未通过 —— 拒绝输出位姿。', file=sys.stderr)
+        print(f'    原因：{vres.reason}', file=sys.stderr)
+        print('    这正是第 42 条那个「静默给出偏 10 mm 位姿」的场景：'
+              '宁可任务失败，也不能让机械臂扑空后报「执行完成」。',
+              file=sys.stderr)
+        node.destroy_node()
+        rclpy.shutdown()
+        return finish(8)
+
+    # 通过验证后才取中心。**顺序不能颠倒** —— 先算中心再验证的话，
+    # 一个「其实是碎片」的簇也会算出一个精确的数值进入下游，
+    # 看起来比直接失败更可信。
+    center = vres.center[:2]
+    lo, hi = obj.min(axis=0), obj.max(axis=0)
+    size = np.array([np.percentile(obj[:, 0], 99.0) - np.percentile(obj[:, 0], 1.0),
+                     np.percentile(obj[:, 1], 99.0) - np.percentile(obj[:, 1], 1.0),
+                     hi[2] - lo[2]])
 
     print(f'\n=== 目标位姿（{args.frame} 系）===')
     print(f'  点数    {len(obj)}')
     print(f'  中心 xy x {center[0]:+.4f}   y {center[1]:+.4f}'
-          f'   （1-99 分位区间中点，非包围盒中心）')
+          f'   （MCD 内点 + p1p99 分位，非包围盒中心）')
     print(f'  观测范围 dx {size[0]:.4f}  dy {size[1]:.4f}  dz {size[2]:.4f}')
     print(f'  z 区间   [{lo[2]:+.4f}, {hi[2]:+.4f}]')
     print(f'  包围盒   x [{lo[0]:+.4f}, {hi[0]:+.4f}]  y [{lo[1]:+.4f}, {hi[1]:+.4f}]'
           f'   （对比用）')
 
     # ---------------------------------------------------------------------
-    # 有效性检查：不合格就直接退出，不要输出一个「看起来正常」的错误位姿。
+    # 有效性检查已上移到几何验证那一步（validate_and_estimate）。
     #
-    # 为什么必须查：物体偏离相机视野中心时，视野里只剩它的一部分，算法就在
-    # 这块**碎片**上算中心，误差会一路恶化到 10 mm。实测（臂在扫描位形）：
+    # 原先这里是「跨度 ∈ 工件尺寸 × [0.8, 1.8]」，现已删除。删掉的理由
+    # 写在上面几何验证处的注释里：一句话 —— 跨度对「这是不是一块完整
+    # 的物体」没有任何判断力，而那恰恰是第 42 条踩的坑。
     #
-    #     方块位置              点簇点数   x 跨度    中心 x 误差
-    #     (0.0150, 0.0400)      2444     29.5 mm   +0.50 mm    ← 好
-    #     (0.0267, 0.0245)      2466     26.7 mm   -1.18 mm    ← 工作位
-    #     (0.0450, 0.0245)      1216     16.8 mm   +3.75 mm    ← 边缘
-    #     (0.0380, 0.0080)       328      9.7 mm   +9.72 mm    ← 严重截断
-    #
-    # 而下游（流水线）会把结果直接当位姿用，10 mm 的错位会让机械臂扑空、
-    # 或者更糟 —— 夹到空气却报「执行完成」。这类「安静地给错答案」比直接失败
-    # 危险得多，所以宁可拒绝，也不输出把握不足的结果。
-    #
-    # 判据用**跨度**而不是点数：点数在 1216 与 2466 之间都可能是错的，
-    # 分不开；而跨度是「看到了物体多宽」的直接度量，截断必然体现为跨度变小。
+    # 保留 --min-span-ratio / --max-span-ratio 两个参数只为**兼容旧命令行**，
+    # 它们不再影响判定。删掉参数会让任何还在传它的脚本直接报错 ——
+    # 那比「传了但没生效」更安全，但会让标定脚本莫名其妙崩掉。
+    # 等确认没有脚本再传它们之后删。
     # ---------------------------------------------------------------------
-    if args.expect_size > 0:
-        span = (float(x_hi - x_lo), float(y_hi - y_lo))
-        lo_lim = args.expect_size * args.min_span_ratio
-        hi_lim = args.expect_size * args.max_span_ratio
-        bad = [n for n, s in zip(('x', 'y'), span) if not lo_lim <= s <= hi_lim]
-        print(f'\n=== 有效性检查（预期工件 {args.expect_size*1000:.0f} mm，'
-              f'允许跨度 {lo_lim*1000:.0f}~{hi_lim*1000:.0f} mm）===')
-        print(f'  实测跨度 x {span[0]*1000:.1f} mm   y {span[1]*1000:.1f} mm')
-        if bad:
-            print(f'  ✗ {"/".join(bad)} 方向跨度不在允许范围内 —— '
-                  f'目标可能只有一部分在视野里，算出来的中心是「碎片中心」。',
-                  file=sys.stderr)
-            print(f'    解决办法：把目标移到相机视野中心附近，或调整扫描位形'
-                  f'（SCAN_POSE）。不要在结果可疑时继续用。', file=sys.stderr)
-            node.destroy_node()
-            rclpy.shutdown()
-            return finish(8)
-        if len(obj) < args.min_points_total:
-            print(f'  ✗ 点数 {len(obj)} 少于下限 {args.min_points_total} —— '
-                  f'目标多半没被完整看到。', file=sys.stderr)
-            node.destroy_node()
-            rclpy.shutdown()
-            return finish(8)
-        print('  ✓ 通过')
+    if args.min_span_ratio != 0.80 or args.max_span_ratio != 1.80:
+        print('注意：--min-span-ratio / --max-span-ratio 已不再参与判定'
+              '（跨度判据已被多重几何验证取代），这两个值被忽略。',
+              file=sys.stderr)
 
     # 相机几乎垂直向下（实测光轴与竖直只差 8.5 度），25 mm 高的侧面在图像里
     # 只摊开 25*sin(12.3) ≈ 5 mm —— 于是点云实际只覆盖了目标顶面，中心高度
@@ -455,8 +480,8 @@ def main():
                 print(f'  误差      dz {center_z - truth[2]:+.4f}'
                       '   ← 与贴地反推的 center_z 比')
 
-    # 机器可读输出。字段说明（下游 grab_pipeline 会照这些语义用）：
-    #   center_xy   实测，可直接用（实测误差 2.0 / 0.0 mm）
+    # 机器可读输出。字段说明（下游 grasp_pipeline 会照这些语义用）：
+    #   center_xy   实测，MCD + p1p99 稳健中心。可直接用。
     #   center_z    **反推值**，不是量出来的；相机近乎垂直向下，只拍到顶面。
     #               误差实测 +1.2 mm，别当精确值用。
     #   size_xy     **高估值**。点是物体顶面的投影再叠上边缘与深度噪声，
@@ -464,6 +489,10 @@ def main():
     #               尺寸用的话得先减掉这个膨胀，否则 planning 里的方块
     #               比实物大 3~4 mm。
     #   size_z      只反映可见的那层顶面（实测 5.6 mm），不是物体高度。
+    #
+    # 新增的 validation_* 字段是为了让下游能**看到**判据的余量，而不只是
+    # 拿到一个布尔值。之前第 42 条之所以难查，正因为流水线只看到
+    # 「感知成功」和一个偏 10 mm 的数字，看不出哪一项判据擦边而过。
     payload = {
         'center_xy': [round(float(center[0]), 5), round(float(center[1]), 5)],
         'center_z': None if center_z is None else round(float(center_z), 5),
@@ -474,6 +503,16 @@ def main():
         'n_points': int(len(obj)),
         'n_clusters': int(len(clusters)),
         'frame': args.frame,
+        # 几何验证的中间量（供日志与标定，勿当精度指标用）
+        'validation': {
+            'planar_rms_mm': round(vres.planar_rms * 1000, 3),
+            'hull_area_ratio': round(vres.hull_area_ratio, 3),
+            'normal_score': round(vres.normal_score, 4),
+            'mcd_inliers': int(vres.inliers.sum()),
+            'residual_rms_mm': round(vres.residual * 1000, 3),
+            'checks': {k: {'ok': bool(v[0]), 'value': str(v[1])}
+                       for k, v in vres.checks.items()},
+        },
     }
     if args.model:
         payload['gazebo_truth'] = truth

@@ -370,6 +370,53 @@ def add_object_to_scene(xyz, size):
     return r.returncode == 0
 
 
+def verify_physical_grasp(verbose=True):
+    """执行完「抬起」后，问 Gazebo **物理到底抓到没有**。
+
+    这是整条流水线最重要的一步。原因见 docs/踩坑记录.md 第 45 条：
+    有一轮流水线打印「执行完成」，而实测抬起只上升0.5 mm—— 抓的是空气。
+    同一次执行里 MTC 报 SUCCESS、arm_controller 报 SUCCESS、
+    attached_collision_object 也是齐的。**三个语义层一致地给出了
+    错误的结论**，因为它们答的都不是「方块有没有被夹着抬起来」。
+
+    铁律第3 条：判定抓取成功与否必须问物理状态，绝不看 MoveIt 的语义状态。
+
+    这里刻意**不**用 MTC 的阶段来做这件事，原因是时序：
+    MTC 的所有阶段都在**规划阶段**求值，那一刻没有任何东西被执行过，
+    Gazebo 里的方块还在原地。而「抓没抓到」只有在轨迹**真的跑完**之后
+    才有意义。所以验证必须发生在 execute_solution() 之后、
+    「执行完成」这几个字被打印之前 —— 也就是这个函数被调用的位置。
+
+    返回 (ok: bool, 说明文字)。**调用方必须先判 ok**。
+    失败时绝不打印「执行完成」。
+    """
+    # grasp_verify 放在 tools/ 下，与本脚本不同目录，加进 path。
+    # 为什么不 import 到文件头：grasp_verify 会跑 ps / ign 命令，
+    # 放在文件头 import 意味着每次启动流水线都会执行它的模块级代码。
+    sys.path.insert(0, os.path.join(_WS, 'tools'))
+    try:
+        from grasp_verify import verify_grasp
+    except ImportError as exc:                     # noqa: BLE001
+        # 导入失败**不能当成通过**。那正是第 45 条那类问题的根源：
+        # 验证环节悄悄缺席，流水线照打「执行完成」。
+        # 所以这里选择失败并说清原因。
+        msg = (f'无法导入抓取验证模块（{exc}）。'
+               f'路径：{os.path.join(_WS, "tools/grasp_verify.py")}。'
+               f'**拒绝报成功** —— 验证缺席时「执行完成」是不可信的。')
+        if verbose:
+            print(msg, file=sys.stderr)
+        return False, msg
+
+    #观察时长给3.0 s 仿真时间：抬起段实测 1.5~2 s，要覆盖整个过程。
+    # 给短了会只看到抬起的开头，得到「没抬够」的假失败。
+    res = verify_grasp(duration=3.0, verbose=verbose)
+
+    if res.ok:
+        return True, res.summary()
+    return False, (f'{res.reason}'
+                   + ('\n    ' + '\n    '.join(res.detail) if res.detail else ''))
+
+
 def main():
     if len(sys.argv) < 2:
         print('本脚本需要 launch 注入 MoveIt 参数，请这样启动：\n'
@@ -803,7 +850,33 @@ def main():
         if not execute_solution(parts):
             print('执行失败', file=sys.stderr)
             return 4
-        print('执行完成')
+
+        # ==================================================================
+        # 物理验证 —— 「执行完成」这四个字**只能**从这里之后打印。
+        # ==================================================================
+        # 顺序理由：轨迹跑完不等于抓住了东西。必须在 execute_solution 之后
+        # 问 Gazebo，因为在那之前方块还在原地，任何验证都只会说「没动」。
+        #
+        # 第 45 条的教训：以前这里是
+        #     print('执行完成'); return 0
+        # 无条件打印，于是「抓的是空气」与「真的抓到了」在日志里长得
+        # 一模一样。现在失败会返回非零并说清是哪一项判据没过。
+        #
+        # 注意 do_place 为假时（只抓不起）也要验证 —— 抓取是否成功
+        # 与后续是否放回无关。而且那时抬起已经发生，验证条件是满足的。
+        print('\n验证物理抓取结果 ...')
+        ok, msg = verify_physical_grasp()
+        if not ok:
+            print('\n**抓取验证失败**', file=sys.stderr)
+            print(msg, file=sys.stderr)
+            print('\n不回滚机械臂状态（它已经抬起来了）。'
+                  '方块的真实位置见上面各项判据的数据 —— '
+                  '若抬升为 0，说明夹爪抓的是空气，检查：'
+                  '感知给的中心是否偏了、夹爪闭合角是否够。',
+                  file=sys.stderr)
+            return 9
+        print(f'  ✓ {msg}')
+        print('执行完成（已通过物理验证）')
 
     time.sleep(0.5)   # 让 introspection 的消息发完再退出
     return 0

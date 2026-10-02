@@ -98,12 +98,69 @@
        注意：damping / friction 只影响 Gazebo 物理，RViz 里不起作用；
           它们顶不住重力（静止时阻尼力矩为 0），防下垂靠控制器闭环。
        ========================================================================== -->
+  <!-- ==================================================================
+       关节限位：这里给的是**物理硬限位**
+
+       ⚠️ 不要为了「让腕关节别顶限位」而改这两个值。
+          那是本文件最容易犯的误用，理由写在这里：
+
+          URDF 的 <limit> 是对**物理约束**的声明：舵机臂真的转不过去，
+          超过去要么撞机械限位要么损坏。soft_joint_limit / safety 之类
+          的软限位机制Gazebo 支持得并不好，而且即便生效，
+          「希望关节别贴边」这件事也不该由物理约束来表达。
+
+          「希望关节远离限位」的正确表达位置是**规划模型**：
+            · joint_limits.yaml  —— 规划侧的软限位（本工程已做：
+              wrist / claw_base 收到 ±1.50）
+            · tools/joint_limit_cost.py —— Pick-IK 的连续代价函数
+              （比一刀切的限位更好：它在所有满足位置约束的解里
+              自动挑远离限位的那个，不会像收紧限位那样把合法解排除掉）
+
+          实测（docs/踩坑记录.md 第 31 条）：抓取时 wrist 与 claw_base
+          确实跑到 -1.57080（正好是这里的值），此时跟踪误差峰值
+          0.077~0.080 rad，而 arm_controller 的 trajectory 容差是
+          0.12 rad —— 余量只剩 1.5 倍。那次 CONTROL_FAILED(-4) 就是
+          关节顶在硬止点上、位置约束与伺服抢同一个自由度造成的。
+          ================================================================== -->
   <xacro:property name="arm_joint_lower"    value="-1.5708"/>
   <xacro:property name="arm_joint_upper"    value=" 1.5708"/>
   <xacro:property name="arm_joint_effort"   value="10.0"/>
   <xacro:property name="arm_joint_velocity" value="3.0"/>
   <xacro:property name="arm_joint_damping"  value="0.10"/>
   <xacro:property name="arm_joint_friction" value="0.05"/>
+
+  <!-- ================================================================
+       若确实需要把软限位写进 URDF（比如为了让 RViz 显示限位框），
+       用下面这种写法，且必须满足三个约束（都来自实测，不是通用建议）：
+
+       ① 只对**腕部两个关节**写软限位，另外三个臂关节不写。
+          实测 top_plate / lower_arm / upper_arm 离限位都很远
+          （最小 0.25~0.39 rad），收它们纯属浪费可用范围。
+
+       ② 内缩量取 3~5°（0.052~0.087 rad），**不要超过 0.0708 rad**。
+          0.0708 rad 正好是 ±1.5708 → ±1.50，与 joint_limits.yaml 里
+          已有的那层余量一致。再往里收就会让
+          tools/solve_grasp_poses.py 解出的设计抓取位形
+          （wrist = -1.466，距 ±1.50 只有 0.034 rad）直接不可达 ——
+          这是「为了让关节远离限位而把唯一能用的解排除掉」。
+
+          反过来，太小（如 0.02 rad）又挡不住实测那个跑到 -1.5708 的坏解：
+          规划器完全可以给出一个 -1.53 的目标，它仍在限内。
+
+       ③ **不要**用 safety_controller。Gazebo Fortress 对
+          safety_controller 的 soft limit 支持不完整，且它会在物理层
+          强行阻止关节运动，表现是「关节卡住不动」——
+          那正是踩坑记录第 31 条里被误判成「wrist_joint 被锁死」
+          的那个现象的另一种可能来源（那条最终结论是干净环境下
+          根本没复现，所以「锁死」这个说法已被更正）。
+
+       写法（示例，默认注释掉，因为本工程用 joint_limits.yaml 那一层）：
+       <joint name="wrist_joint" type="revolute">
+         <limit lower="-1.5000" upper="1.5000"
+                effort="${arm_joint_effort}"
+                velocity="${arm_joint_velocity}"/>
+       </joint>
+       ================================================================ -->
 
   <!-- 夹爪：两个「绕轴旋转」的手指，单位 rad
        注意：这里刻意不用 prismatic（平移）关节，理由见文件末尾「夹爪方案」一节。
