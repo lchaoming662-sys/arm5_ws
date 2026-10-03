@@ -370,7 +370,7 @@ def add_object_to_scene(xyz, size):
     return r.returncode == 0
 
 
-def verify_physical_grasp(verbose=True):
+def verify_physical_grasp(verbose=True, monitor=None):
     """执行完「抬起」后，问 Gazebo **物理到底抓到没有**。
 
     这是整条流水线最重要的一步。原因见 docs/踩坑记录.md 第 45 条：
@@ -407,9 +407,12 @@ def verify_physical_grasp(verbose=True):
             print(msg, file=sys.stderr)
         return False, msg
 
-    #观察时长给3.0 s 仿真时间：抬起段实测 1.5~2 s，要覆盖整个过程。
-    # 给短了会只看到抬起的开头，得到「没抬够」的假失败。
-    res = verify_grasp(duration=3.0, verbose=verbose)
+    # 观察数据来源：给了 monitor 就用它在**执行全程**采的样本
+    # （z 参考系 = 执行开始前方块贴地的高度），否则退回窗口采样 ——
+    # 但窗口模式量不到执行期间发生过的抬升，只适合独立诊断。
+    res = verify_grasp(duration=3.0, verbose=verbose,
+                       samples=(monitor.samples if monitor is not None
+                                else None))
 
     if res.ok:
         return True, res.summary()
@@ -846,8 +849,26 @@ def main():
         print('已发到 RViz 的 MTC 面板（Motion Planning Tasks）')
 
     if os.environ.get('MTC_EXECUTE', '').lower() in ('1', 'true'):
+        # 物理采样必须**跨执行过程**（踩坑 55 条）：抬升发生在轨迹执行
+        # 期间，执行完再开观察窗口只能看到静止的终态，「峰值抬升」
+        # 永远量不出非零值 —— 验证的通过路径不存在。采样线程先起，
+        # 执行完再停，验证用全程样本。
+        sys.path.insert(0, os.path.join(_WS, 'tools'))
+        try:
+            from grasp_verify import GraspMonitor
+        except ImportError as exc:
+            print(f'无法导入抓取采样器（{exc}）。**拒绝执行** —— '
+                  '没有采样就没有验证，没有验证的「执行完成」不可信。',
+                  file=sys.stderr)
+            return 5
+        mon = GraspMonitor()
+        mon.start()
         print('开始执行 ...')
-        if not execute_solution(parts):
+        try:
+            exec_ok = execute_solution(parts)
+        finally:
+            mon.stop()
+        if not exec_ok:
             print('执行失败', file=sys.stderr)
             return 4
 
@@ -865,7 +886,7 @@ def main():
         # 注意 do_place 为假时（只抓不起）也要验证 —— 抓取是否成功
         # 与后续是否放回无关。而且那时抬起已经发生，验证条件是满足的。
         print('\n验证物理抓取结果 ...')
-        ok, msg = verify_physical_grasp()
+        ok, msg = verify_physical_grasp(monitor=mon)
         if not ok:
             print('\n**抓取验证失败**', file=sys.stderr)
             print(msg, file=sys.stderr)

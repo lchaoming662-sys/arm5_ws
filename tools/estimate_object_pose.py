@@ -378,7 +378,9 @@ def main():
 
     print(f'  {vres.summary()}')
     for name, (ok, val, thr) in vres.checks.items():
-        print(f'    {"✓" if ok else "✗"} {name:20s} 实测 {val:>18s}'
+        # val 可能是 float（面残差）也可能 int（样本数），统一转 str 再对齐，
+        # 否则 int 撞上 '>18s' 直接 ValueError（全链路回归 2026-10-03 实测）
+        print(f'    {"✓" if ok else "✗"} {name:20s} 实测 {str(val):>18}'
               f'   要求 {thr}')
     if not vres.ok:
         print(f'\n  ✗ 几何验证未通过 —— 拒绝输出位姿。', file=sys.stderr)

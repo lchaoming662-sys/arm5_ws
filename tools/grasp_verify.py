@@ -90,6 +90,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -157,17 +158,22 @@ CONTACT_FORCE_EPS = 1e-6
 # 这也是为什么它必须与 z 抬升联合使用，且必须在抬起之后才采样。
 CONTACT_POINT_EPS = 4          # 少于这个数视为无接触（方块底面是 4 个角）
 
-# 不依赖接触消息的物理判据：方块在「夹持窗口」内的运动学一致性。
+# 不依赖接触消息的物理判据：方块在**离地段**相对机械臂的位移变化。
 #
-# 判据：抬起过程中方块相对夹爪的位移必须很小。
-# 若真的夹住了，方块与指尖是刚性的，相对位移 ≈ 0；
-# 若抓的是空气，方块留在地上，相对位移 = 整个抬升量（约 50 mm）。
+# 判据：以第一个「方块已离地」样本为参考，量后续离地样本相对它的
+# 水平位移变化。真夹住了 → 方块与指尖刚性同动 → 变化 ≈ 0~3 mm；
+# 中途脱手 → 方块被留在原地而机械臂继续走 → 变化长到几十 mm。
 # 这个量只用 ign model -p 读位姿，不碰任何接触话题 ——
-# 因此它在DART 6.12 的环境下**照样可用**。
+# 因此它在 DART 6.12 的环境下**照样可用**。
 #
 # 阈值 15 mm 的来历：夹爪在抬起过程中有软伺服滞后与方块轻微滑移，
-# 实测（干净环境成功抓取）相对位移在 5 mm 以内；15 mm 留了三倍余量，
-# 又远小于「没抓到」时的 50 mm。
+# 实测（干净环境成功抓取）变化在 5 mm 以内；15 mm 留了三倍余量。
+#
+# 【分辨力边界，2026-10-03 全链路回归时如实标注】本流程的抬起与放回
+# 都是**纯竖直**运动（原位放回）：「抓空气」时方块留在地上，相对位移
+# 变化同样是 ~0 —— 所以「抓没抓到」主要由抬升判据回答（抓空气抬升
+# 0.5 mm，阈值 30 mm，分得极开）；滑移判据分辨的是「抬着但已脱手」
+# 的中间态，以及未来加了水平搬运段之后的脱落。
 REL_SLIP_MAX = 0.015
 
 # 抬升判据保持不变（这是最可靠的一条）
@@ -463,9 +469,60 @@ def read_tcp_pose(model='o5_2_arm'):
 # 主验证逻辑
 # ===========================================================================
 
+class GraspMonitor:
+    """跨执行过程的后台物理状态采样器（线程）。
+
+    为什么必须有它（2026-10-03 全链路回归发现）：verify_grasp() 自己的
+    观察窗口在轨迹全部跑完之后才开始，那时方块要么已举在顶、要么已
+    放回台面，窗口内 z 不再变化 —— 「峰值抬升 > 30 mm」在那种时序下
+    永远量不出非零值，验证的通过路径根本不存在。抬升与滑移都必须在
+    **执行期间**连续采样才可测。
+
+    用法：
+        mon = GraspMonitor()
+        mon.start()                    # 发轨迹之前
+        ... 执行 ...
+        mon.stop()
+        result = verify_grasp(samples=mon.samples)
+
+    线程安全：只有采样线程写 samples，stop() join 之后主线程才读。
+    采样节奏：间隔 = interval 仿真秒，ign 子进程的墙上开销用
+    「本轮已耗时间」抵扣（否则 RTF 高时进程开销会把间隔撑大数倍，
+    实测采到 4/30 个点，见 verify_grasp 内同名注释）。
+    """
+
+    def __init__(self, model='target_cube', arm_model='o5_2_arm', interval=0.1):
+        self.model = model
+        self.arm_model = arm_model
+        self.interval = interval
+        self.samples = []              # [(cube_xyz, arm_xyz_or_None)]
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        rtf = max(_rtf(), 0.05)        # 执行期间 RTF 会波动，但只影响
+        while not self._stop.is_set(): # 采样疏密，峰值/p99 对疏密不敏感
+            t_iter = time.time()
+            cube = read_cube_pose(self.model)
+            arm = read_tcp_pose(self.arm_model) if cube is not None else None
+            if cube is not None:
+                self.samples.append((cube, arm))
+            spent = time.time() - t_iter
+            time.sleep(max(0.0, self.interval / rtf - spent))
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=15)
+
+
 def verify_grasp(duration=3.0, interval=0.1, lift_threshold=LIFT_THRESHOLD,
                  slip_max=REL_SLIP_MAX, model='target_cube',
-                 arm_model='o5_2_arm', verbose=True):
+                 arm_model='o5_2_arm', verbose=True, samples=None):
     """观察方块的物理状态，判断是否真的抓取成功。
 
     参数
@@ -526,35 +583,52 @@ def verify_grasp(duration=3.0, interval=0.1, lift_threshold=LIFT_THRESHOLD,
             '这不是把误差糊过去，而是换一条本机真的能测的物理量。')
 
     # ---- 观察 ----
-    say(f'[观察] 开始采样，仿真时长 {duration:.1f} s...')
-    rtf = max(_rtf(), 0.05)
-    t_end = time.time() + duration / rtf
-    zs, rels = [], []
-    n_expected = max(int(duration / interval), 1)
-    while time.time() < t_end and len(zs) < n_expected:
-        cube = read_cube_pose(model)
-        if cube is not None:
-            zs.append(cube[2])
-            arm = read_tcp_pose(arm_model)
-            if arm is not None:
-                # 相对位移的**水平分量**：只比 x/y，不比 z。
-                # 为什么：机器人在抬起时自身也在动（base_link 高度不变，
-                # 但如果以后改成从基座抬升就会变）。水平方向的相对位移
-                # 才是「方块有没有被留在原地」的直接度量。
-                rels.append((cube[0] - arm[0], cube[1] - arm[1]))
-        time.sleep(interval / rtf)
+    if samples is not None:
+        # 监视器路径：samples 由 GraspMonitor 在**执行全程**采集，
+        # 每项 (cube_xyz, arm_xyz_or_None)。z 参考系 = 首样本 =
+        # 执行开始前的方块高度（在地上），「峰值抬升」才有意义。
+        pairs = list(samples)
+        say(f'[观察] 使用监视器样本 {len(pairs)} 个（覆盖执行全程）')
+    else:
+        say(f'[观察] 开始采样，仿真时长 {duration:.1f} s...')
+        rtf = max(_rtf(), 0.05)
+        # ign model -p 每次调用都是一个子进程，墙上开销 0.3~1 s 且与 RTF 无关。
+        # 墙上预算若只按 duration/rtf 给，RTF 高（机器空闲）时预算缩水，
+        # 子进程开销会把有效采样间隔撑大 5~8 倍 —— 实测（2026-10-03，
+        # RTF≈0.86）只采到 4/30 个点，被下面的前置检查 C 正确拒掉。
+        # 修法：预算加上每个采样点的进程开销余量，且每轮 sleep 扣除本轮
+        # 已耗时间 —— 「间隔 = interval 仿真秒」的本意不变。
+        IGN_CALL_COST = 1.5          # 秒（墙上），一次 ign 子进程的悲观估计
+        n_expected = max(int(duration / interval), 1)
+        t_end = time.time() + duration / rtf + n_expected * IGN_CALL_COST
+        pairs = []
+        while time.time() < t_end and len(pairs) < n_expected:
+            t_iter = time.time()
+            cube = read_cube_pose(model)
+            arm = read_tcp_pose(arm_model) if cube is not None else None
+            if cube is not None:
+                # 相对位移的**水平分量**：只比 x/y，不比 z。为什么见
+                # 判据 ② 处的注释（基座高度不变，水平相对位移才是
+                # 「方块有没有被留在原地」的直接度量）。
+                pairs.append((cube, arm))
+            spent = time.time() - t_iter
+            time.sleep(max(0.0, interval / rtf - spent))
 
-    r.n_samples = len(zs)
-    # ---- 前置检查 C：采样可信 ----
-    r.sample_trustworthy = (r.n_samples >= n_expected * SAMPLE_RATIO_MIN)
-    say(f'[前置] 采样 {r.n_samples}/{n_expected} 个点，'
-        f'可信：{r.sample_trustworthy}')
-    if not zs:
+    r.n_samples = len(pairs)
+    if samples is not None:
+        # 执行全程的采样数取决于执行时长与 RTF，没有固定期望值可卡；
+        # 下限 15 个 ≈ 窗口法 3 s × 10 Hz 的量级。低于它说明 ign 调用
+        # 大面积失败或线程几乎没跑，测量不可信。
+        r.sample_trustworthy = r.n_samples >= 15
+    else:
+        r.sample_trustworthy = (r.n_samples >= n_expected * SAMPLE_RATIO_MIN)
+    say(f'[前置] 采样 {r.n_samples} 个点，可信：{r.sample_trustworthy}')
+    if not pairs:
         r.reason = ('读不到方块位姿（ign model -p 无输出）。'
                     '确认世界名与模型名对得上。')
         return r
     if not r.sample_trustworthy:
-        r.reason = (f'采样太稀疏（{r.n_samples}/{n_expected}），'
+        r.reason = (f'采样太稀疏（{r.n_samples}），'
                     f'测量不可信，拒绝出结论')
         return r
 
@@ -562,9 +636,9 @@ def verify_grasp(duration=3.0, interval=0.1, lift_threshold=LIFT_THRESHOLD,
     # 不过**峰值抬升**这个量本身就该用峰值 —— 我们要的就是「最高抬到多高」。
     # 折中做法：取 99 分位作为峰值，避免单个数值异常尖峰把结论带偏；
     # 同时保留真实 max 供对照打印。
-    r.z_start = float(zs[0])
-    r.z_peak = float(max(zs))
-    z_p99 = float(sorted(zs)[int(0.99 * (len(zs) - 1))])
+    r.z_start = float(pairs[0][0][2])
+    r.z_peak = float(max(p[0][2] for p in pairs))
+    z_p99 = float(sorted(p[0][2] for p in pairs)[int(0.99 * (len(pairs) - 1))])
     r.z_lift = max(z_p99, 0.0) - r.z_start
 
     # ---- 判据 ①：抬升 ----
@@ -575,30 +649,58 @@ def verify_grasp(duration=3.0, interval=0.1, lift_threshold=LIFT_THRESHOLD,
         f' → {"通过" if r.lift_pass else "**不通过**"}')
 
     # ---- 判据 ②：相对滑移 ----
-    # 只在**方块已离开地面**之后才有意义：贴地时方块与机械臂的水平
-    # 关系完全由「机械臂在哪儿」决定，方块根本不动，滑移量会很大 ——
-    # 但那不是「没抓住」，那是「还没开始抬」。所以先看① 过不过。
+    # 只在**方块已离开地面**的样本上算。两个理由：
+    #   · 贴地阶段（接近段）方块本来就不动，而 tcp 还在抓取点之外，
+    #     水平相对距离是「还没抓」的正常值，混进来会把滑移虚报得很大
+    #     —— 监视器跨执行全程采样后这个污染必须滤掉；
+    #   · 贴地时方块与机械臂的水平关系完全由「机械臂在哪儿」决定，
+    #     那不是「没抓住」的信号。
     if not r.lift_pass:
         r.contact_pass = False
         r.rel_slip = None
         r.detail.append('未抬起，滑移不作为判据（方块还在地上）')
-    elif not rels:
-        r.contact_pass = False
-        r.reason_short = '读不到机械臂位姿，滑移判据无法计算'
-        r.detail.append('**读不到机械臂位姿**（ign model -m o5_2_arm -p '
-                        '无输出），滑移判据无法计算 —— 测量条件不完整，'
-                        '按不可信处理')
     else:
-        # 用 99 分位而不是 max：单帧的数值抖动不该决定结论
-        arr = np.array(rels)
-        d = np.linalg.norm(arr, axis=1)
-        slip_p99 = float(np.percentile(d, 99.0))
-        r.rel_slip = slip_p99
-        r.contact_pass = slip_p99 < slip_max
-        r.detail.append(
-            f'相对滑移 p99 {slip_p99*1000:.1f} mm（max '
-            f'{float(d.max())*1000:.1f} mm），阈值 {slip_max*1000:.0f} mm'
-            f' → {"通过" if r.contact_pass else "**不通过**"}')
+        rels_air = [(p[0][0] - p[1][0], p[0][1] - p[1][1])
+                    for p in pairs
+                    if p[1] is not None and p[0][2] > r.z_start + 0.010]
+        if not rels_air:
+            # 通过了抬升判据却找不到离地样本？说明过滤条件与采样对不上，
+            # 退回「有臂位姿的全部样本」并在明细里明说 —— 不安静地换口径。
+            rels_air = [(p[0][0] - p[1][0], p[0][1] - p[1][1])
+                        for p in pairs if p[1] is not None]
+            r.detail.append('（无离地样本，滑移退回全程样本计算）')
+        if not rels_air:
+            r.contact_pass = False
+            r.rel_slip = None
+            r.reason_short = '读不到机械臂位姿，滑移判据无法计算'
+            r.detail.append('**读不到机械臂位姿**（ign model -m o5_2_arm -p '
+                            '无输出），滑移判据无法计算 —— 测量条件不完整，'
+                            '按不可信处理')
+        else:
+            # 「滑移」量的是**位移的变化**，不是到基座的绝对距离。
+            # 基座原点不动，rel = cube_xy − base_xy 就是方块的世界坐标
+            # 模长 —— 方块被夹着平移/原位搬运时它恒在 36 mm 上下，
+            # 拿绝对距离当滑移会把成功的抓放误杀成「滑移 39 mm」
+            # （2026-10-03 全链路回归实测：抬升 47.8 mm 通过、原位放回
+            # 落点偏差 2 mm，滑移却报 39.4 mm）。
+            # 正确口径：以**第一个离地样本**为参考点，量后续离地样本
+            # 相对它的位移。真夹住 → 方块与臂刚性同动 → 变化 ≈ 0~3 mm；
+            # 中途脱落 → 方块被留在原地而臂继续走 → 变化长到几十 mm
+            # （前提是脱落后有水平行程；本流程是原位放回、纯竖直运动，
+            # 脱落判别主要靠抬升判据，滑移只对「抬着但已脱手」的
+            # 中间态有分辨力 —— 这个边界如实写在这里）。
+            ref = rels_air[0]
+            disp = np.array(rels_air) - np.array(ref)
+            d = np.linalg.norm(disp, axis=1)
+            slip_p99 = float(np.percentile(d, 99.0))
+            r.rel_slip = slip_p99
+            r.contact_pass = slip_p99 < slip_max
+            r.detail.append(
+                f'相对滑移（离地段相对首离地样本的位移变化）'
+                f'p99 {slip_p99 * 1000:.1f} mm'
+                f'（离地样本 {len(rels_air)}/全程 {len(pairs)}）'
+                f'，阈值 {slip_max * 1000:.0f} mm'
+                f' → {"通过" if r.contact_pass else "**不通过**"}')
 
     # ---- 接触力（有 wrench 时作为附加判据，不替代滑移）----
     if r.force_available and r.lift_pass:
