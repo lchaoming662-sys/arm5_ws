@@ -41,6 +41,9 @@ def generate_launch_description():
     # for execution」，它走的就是这个 capability 提供的 action。
     # 缺了它，MTC 规划能成功、执行却直接返回 FAILURE(99999)，
     # 而且 move_group 侧几乎不打印任何东西 —— 很难从现象反推原因。
+    # 注意：不列 move_group/MoveGroupPickPlaceAction —— Humble 里没有这个类，
+    # 列了每次启动刷一条 ERROR（"class does not exist"），且 Pick/Place 功能
+    # 本项目由 MTC 提供，不走这个 capability。
     capabilities = " ".join([
         "move_group/ApplyPlanningSceneService",
         "move_group/ClearOctomapService",
@@ -49,7 +52,6 @@ def generate_launch_description():
         "move_group/MoveGroupGetPlanningSceneService",
         "move_group/MoveGroupKinematicsService",
         "move_group/MoveGroupMoveAction",
-        "move_group/MoveGroupPickPlaceAction",
         "move_group/MoveGroupPlanService",
         "move_group/MoveGroupQueryPlannersService",
         "move_group/MoveGroupStateValidationService",
